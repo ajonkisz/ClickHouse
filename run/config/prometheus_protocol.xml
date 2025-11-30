@@ -1,0 +1,59 @@
+<clickhouse>
+  <prometheus>
+    <port>9363</port>
+    <handlers>
+      <expose>
+        <url>/metrics</url>
+        <handler>
+          <type>expose_metrics</type>
+          <metrics>true</metrics>
+          <asynchronous_metrics>true</asynchronous_metrics>
+          <events>true</events>
+          <errors>true</errors>
+          <histograms>true</histograms>
+          <dimensional_metrics>true</dimensional_metrics>
+        </handler>
+      </expose>
+      
+      <write>
+        <url>/write</url>
+        <handler>
+          <type>remote_write</type>
+          <database>otel</database>
+          <table>metrics</table>
+        </handler>
+      </write>
+      
+      <read>
+        <url>/read</url>
+        <handler>
+          <type>remote_read</type>
+          <database>otel</database>
+          <table>metrics</table>
+        </handler>
+      </read>
+      
+      <query_range>
+        <url>/api/v1/query_range</url>
+        <handler>
+          <type>query_api</type>
+          <!-- FIXED: Explicitly point to the metrics table -->
+          <database>otel</database>
+          <table>metrics</table>
+          <!-- Set default lookback delta to 5 minutes (300 seconds) -->
+          <lookback_delta>300</lookback_delta>
+        </handler>
+      </query_range>
+
+      <query>
+        <url>/api/v1/query</url>
+        <handler>
+          <type>query_api</type>
+          <!-- FIXED: Explicitly point to the metrics table -->
+          <database>otel</database>
+          <table>metrics</table>
+        </handler>
+      </query>
+    </handlers>
+  </prometheus>
+</clickhouse>

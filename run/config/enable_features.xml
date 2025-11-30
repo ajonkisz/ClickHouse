@@ -1,0 +1,14 @@
+<clickhouse>
+    <profiles>
+        <default>
+            <!-- 
+                Permanently enable the TimeSeries engine and Window Views 
+                for the default user. This is required for the Prometheus 
+                handler to successfully write data.
+            -->
+            <allow_experimental_time_series_table>1</allow_experimental_time_series_table>
+            <allow_experimental_window_view>1</allow_experimental_window_view>
+        </default>
+    </profiles>
+</clickhouse>
+
