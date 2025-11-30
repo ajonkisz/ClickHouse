@@ -10,7 +10,71 @@ This document tracks all AI-assisted development work on ClickHouse TimeSeries f
 
 ---
 
-## Latest Session: Prometheus API Endpoints & PromQL Completion
+## Latest Session: External Table Fix & SELECT Support
+
+### Bug Fix: External Target Tables Not Being Used
+
+**Problem:** When creating a TimeSeries table with external tables, e.g.:
+```sql
+CREATE TABLE otel.metrics 
+ENGINE = TimeSeries() 
+DATA otel.ts_data TAGS otel.ts_tags METRICS otel.ts_metrics;
+```
+The specified external tables were not being used - instead, inner tables were created.
+
+**Root Cause:** In `StorageTimeSeries.cpp` line 164, the logic for `is_inner_table` was inverted:
+```cpp
+// Bug: This was checking if table_id is empty when target_info exists
+target.is_inner_table = target_info && target_info->table_id.empty();
+```
+
+**Fix:**
+```cpp
+// Fixed: is_inner_table is true when NOT using an external table
+bool is_external_target = target_info && !target_info->table_id.empty();
+target.is_inner_table = !is_external_target;
+```
+
+### Correct Syntax for External Tables
+
+**IMPORTANT:** The correct syntax uses keywords, NOT parentheses:
+
+```sql
+-- CORRECT:
+CREATE TABLE otel.metrics 
+ENGINE = TimeSeries() 
+DATA otel.ts_data 
+TAGS otel.ts_tags 
+METRICS otel.ts_metrics;
+
+-- WRONG (this won't work):
+CREATE TABLE otel.metrics 
+ENGINE = TimeSeries(otel.ts_data, otel.ts_tags, otel.ts_metrics);
+```
+
+### SELECT Support Implemented
+
+Added `read()` method implementation to `StorageTimeSeries` that:
+- Analyzes requested columns to determine which target table(s) to query
+- Routes to data table for: `id`, `timestamp`, `value`
+- Routes to tags table for: `id`, `metric_name`, `tags`, `all_tags`, `min_time`, `max_time`
+- Routes to metrics table for: `metric_family_name`, `type`, `unit`, `help`
+
+Example queries that now work:
+```sql
+-- Query data table
+SELECT id, timestamp, value FROM otel.metrics LIMIT 10;
+
+-- Query tags table
+SELECT id, metric_name, all_tags FROM otel.metrics LIMIT 10;
+
+-- Query metrics table
+SELECT metric_family_name, type, help FROM otel.metrics LIMIT 10;
+```
+
+---
+
+## Previous Session: Prometheus API Endpoints & PromQL Completion
 
 ### Prometheus HTTP API Endpoints
 

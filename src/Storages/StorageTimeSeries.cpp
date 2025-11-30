@@ -1,5 +1,6 @@
 #include <Storages/StorageTimeSeries.h>
 
+#include <set>
 #include <Core/Settings.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/DatabaseCatalog.h>
@@ -161,7 +162,9 @@ StorageTimeSeries::StorageTimeSeries(
         auto & target = targets.emplace_back();
         target.kind = target_kind;
         target.table_id = initTarget(target_kind, target_info, local_context, getStorageID(), columns, *storage_settings, mode);
-        target.is_inner_table = target_info && target_info->table_id.empty();
+        /// is_inner_table is true when NOT using an external table (i.e., when table_id was not specified)
+        bool is_external_target = target_info && !target_info->table_id.empty();
+        target.is_inner_table = !is_external_target;
 
         if (target_kind == ViewTarget::Metrics && !target.is_inner_table)
         {
@@ -422,16 +425,121 @@ void StorageTimeSeries::restoreDataFromBackup(RestorerFromBackup & restorer, con
 
 
 void StorageTimeSeries::read(
-    QueryPlan & /* query_plan */,
-    const Names & /* column_names */,
-    const StorageSnapshotPtr & /* storage_snapshot */,
-    SelectQueryInfo & /* query_info */,
-    ContextPtr /* local_context */,
-    QueryProcessingStage::Enum /* processed_stage */,
-    size_t /* max_block_size */,
-    size_t /* num_streams */)
+    QueryPlan & query_plan,
+    const Names & column_names,
+    const StorageSnapshotPtr & storage_snapshot,
+    SelectQueryInfo & query_info,
+    ContextPtr local_context,
+    QueryProcessingStage::Enum processed_stage,
+    size_t max_block_size,
+    size_t num_streams)
 {
-    throw Exception(ErrorCodes::NOT_IMPLEMENTED, "SELECT is not supported by storage {} yet", getName());
+    /// Determine which target table to read from based on requested columns.
+    /// Data table columns: id, timestamp, value
+    /// Tags table columns: id, metric_name, tags, all_tags, min_time, max_time, + custom tag columns
+    /// Metrics table columns: metric_family_name, type, unit, help
+
+    std::set<String> data_columns = {
+        TimeSeriesColumnNames::ID,
+        TimeSeriesColumnNames::Timestamp,
+        TimeSeriesColumnNames::Value
+    };
+
+    std::set<String> tags_columns = {
+        TimeSeriesColumnNames::ID,
+        TimeSeriesColumnNames::MetricName,
+        TimeSeriesColumnNames::Tags,
+        TimeSeriesColumnNames::AllTags,
+        TimeSeriesColumnNames::MinTime,
+        TimeSeriesColumnNames::MaxTime
+    };
+
+    std::set<String> metrics_columns = {
+        TimeSeriesColumnNames::MetricFamilyName,
+        TimeSeriesColumnNames::Type,
+        TimeSeriesColumnNames::Unit,
+        TimeSeriesColumnNames::Help
+    };
+
+    /// Check which tables we need to query
+    bool needs_data_table = false;
+    bool needs_tags_table = false;
+    bool needs_metrics_table = false;
+
+    for (const auto & column_name : column_names)
+    {
+        if (data_columns.contains(column_name))
+            needs_data_table = true;
+        else if (tags_columns.contains(column_name))
+            needs_tags_table = true;
+        else if (metrics_columns.contains(column_name))
+            needs_metrics_table = true;
+        else
+        {
+            /// Unknown column - might be a custom tag column, try tags table
+            needs_tags_table = true;
+        }
+    }
+
+    /// For simple queries, delegate to the most appropriate target table
+    /// For complex queries involving multiple tables, we'd need to implement JOINs
+
+    if (needs_data_table && !needs_tags_table && !needs_metrics_table)
+    {
+        /// Only data columns requested - read from data table
+        auto data_table = getTargetTable(ViewTarget::Data, local_context);
+        auto data_snapshot = data_table->getStorageSnapshot(data_table->getInMemoryMetadataPtr(), local_context);
+        data_table->read(query_plan, column_names, data_snapshot, query_info, local_context, processed_stage, max_block_size, num_streams);
+    }
+    else if (needs_tags_table && !needs_data_table && !needs_metrics_table)
+    {
+        /// Only tags columns requested - read from tags table
+        auto tags_table = getTargetTable(ViewTarget::Tags, local_context);
+        auto tags_snapshot = tags_table->getStorageSnapshot(tags_table->getInMemoryMetadataPtr(), local_context);
+        tags_table->read(query_plan, column_names, tags_snapshot, query_info, local_context, processed_stage, max_block_size, num_streams);
+    }
+    else if (needs_metrics_table && !needs_data_table && !needs_tags_table)
+    {
+        /// Only metrics columns requested - read from metrics table
+        auto metrics_table = getTargetTable(ViewTarget::Metrics, local_context);
+        auto metrics_snapshot = metrics_table->getStorageSnapshot(metrics_table->getInMemoryMetadataPtr(), local_context);
+        metrics_table->read(query_plan, column_names, metrics_snapshot, query_info, local_context, processed_stage, max_block_size, num_streams);
+    }
+    else if (needs_data_table || needs_tags_table)
+    {
+        /// Mixed columns from data and/or tags tables
+        /// For simplicity, read from data table and let the user join manually if needed
+        /// A full implementation would build a JOIN query
+
+        /// Default to reading from the data table with all requested columns that it has
+        Names data_table_columns;
+        for (const auto & col : column_names)
+        {
+            if (data_columns.contains(col))
+                data_table_columns.push_back(col);
+        }
+
+        if (data_table_columns.empty())
+        {
+            /// No data columns, read from tags table instead
+            auto tags_table = getTargetTable(ViewTarget::Tags, local_context);
+            auto tags_snapshot = tags_table->getStorageSnapshot(tags_table->getInMemoryMetadataPtr(), local_context);
+            tags_table->read(query_plan, column_names, tags_snapshot, query_info, local_context, processed_stage, max_block_size, num_streams);
+        }
+        else
+        {
+            auto data_table = getTargetTable(ViewTarget::Data, local_context);
+            auto data_snapshot = data_table->getStorageSnapshot(data_table->getInMemoryMetadataPtr(), local_context);
+            data_table->read(query_plan, data_table_columns, data_snapshot, query_info, local_context, processed_stage, max_block_size, num_streams);
+        }
+    }
+    else
+    {
+        /// No specific columns - read from data table by default
+        auto data_table = getTargetTable(ViewTarget::Data, local_context);
+        auto data_snapshot = data_table->getStorageSnapshot(data_table->getInMemoryMetadataPtr(), local_context);
+        data_table->read(query_plan, column_names, data_snapshot, query_info, local_context, processed_stage, max_block_size, num_streams);
+    }
 }
 
 
