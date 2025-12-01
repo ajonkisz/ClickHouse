@@ -887,3 +887,241 @@ All endpoints required for Grafana's Prometheus data source are now functional:
 - ✅ Graph panels (query, query_range)
 - ✅ Variable dropdowns (label values)
 
+---
+
+## Session: Compression Optimization - V3 Schema
+
+### Date: 2025-12-01
+
+### Problem Statement
+
+The initial compression report showed 1.57 bytes/sample, but VictoriaMetrics achieves 0.4 bytes/sample. Goal was to optimize compression and understand the gap.
+
+### Approach
+
+1. Tested various codec combinations on 10M+ rows
+2. Measured bytes/row for each column
+3. Identified optimal configuration
+4. Created V3 schema with improvements
+
+### Codec Testing Results
+
+| Configuration | ID B/row | Timestamp B/row | Value B/row |
+|--------------|----------|-----------------|-------------|
+| Delta + ZSTD(1) | 0.089 | 1.745 | 0.479 |
+| DoubleDelta + ZSTD(1) | 0.089 | 2.536 | 0.479 |
+| **DoubleDeltaVarInt + ZSTD(1)** | 0.089 | **0.889** | 0.479 |
+| UInt64 + ZSTD(3) | **0.051** | 0.875 | 0.475 |
+| UInt32 + ZSTD(3) | **0.023** | 0.873 | 0.476 |
+
+### Key Findings
+
+1. **DoubleDeltaVarInt is 2.5x better** than DoubleDelta for timestamps
+2. **UInt64 is 40% smaller** than UUID for ID column at scale
+3. **ZSTD(3) provides 2-5% improvement** over ZSTD(1)
+4. **ORDER BY (timestamp, id)** gives 0.01 B/row for timestamps but breaks ID compression
+
+### V3 Schema Implementation
+
+Changed default ID type in `TimeSeriesDefinitionNormalizer.cpp`:
+
+```cpp
+// Changed from:
+auto get_uuid_type = [] { return makeASTDataType("UUID"); };
+
+// To:
+auto get_id_type = [] { return makeASTDataType("UInt64"); };
+```
+
+### Compression Comparison
+
+| Version | Configuration | Bytes/Sample |
+|---------|--------------|--------------|
+| V1 | Default codecs | ~2.3 B |
+| V2 | UUID + DoubleDeltaVarInt + GorillaV2 | 1.46 B |
+| **V3** | **UInt64 + DoubleDeltaVarInt + GorillaV2 + ZSTD(3)** | **1.32 B** |
+
+### Column-Level Results
+
+| Column | V2 (63M rows) | V3 (18M rows) | Notes |
+|--------|---------------|---------------|-------|
+| id | 0.090 B | 0.132 B | Improves with scale |
+| timestamp | 0.890 B | **0.356 B** | 2.5x better! |
+| value | 0.482 B | 0.603 B | Data dependent |
+| **Total** | **1.46 B** | **1.32 B** | **10% better** |
+
+### Gap with VictoriaMetrics
+
+| Metric | ClickHouse V3 | VictoriaMetrics | Gap |
+|--------|---------------|-----------------|-----|
+| Total | 1.32 B | ~0.4 B | 3.3x |
+
+**Why VM is smaller:**
+1. Block-level encoding (series ID once per 64K samples)
+2. Bit-level precision (1 bit for dod=0, not 1 byte)
+3. Per-block series grouping
+
+### Files Modified
+
+| File | Changes |
+|------|---------|
+| `src/Storages/TimeSeries/TimeSeriesDefinitionNormalizer.cpp` | Changed default ID type from UUID to UInt64 |
+| `run/config/create_ts_inner_tables_config_v3.sql` | New optimized schema |
+| `programs/server/config.d/prometheus_protocol.xml` | Updated to use metrics_v3 |
+
+### Next Steps for Further Improvement
+
+To achieve 0.4 bytes/sample like VictoriaMetrics:
+1. Implement block-level bit-packed timestamp encoding
+2. Implement block-level value encoding
+3. Store series ID once per block instead of per row
+
+### Report Generated
+
+See `/Users/aj/clickhouse-otel-testing/COMPRESSION_REPORT-v2.md` for full analysis.
+
+---
+
+## Session: Block-Level Codec Implementation
+
+### Date: 2025-12-01
+
+### Problem Statement
+
+Attempted to improve compression beyond V3 by implementing VictoriaMetrics-style block-level bit-packed codecs.
+
+### Codecs Implemented
+
+1. **BlockDoubleDelta** (`0x9f`)
+   - Zigzag encoding for signed delta-of-deltas
+   - Bit-level prefix codes for variable-length encoding
+   - File: `src/Compression/CompressionCodecBlockDoubleDelta.cpp`
+
+2. **BlockGorilla** (`0xa0`)
+   - True bit-level XOR encoding (Facebook Gorilla style)
+   - Leading/trailing zero tracking
+   - File: `src/Compression/CompressionCodecBlockGorilla.cpp`
+
+3. **SeriesBlock** (`0xa1`)
+   - Single-value mode (all same)
+   - Run-length encoding mode
+   - Dictionary encoding mode
+   - File: `src/Compression/CompressionCodecSeriesBlock.cpp`
+
+### Test Results
+
+| Codec | Regular 15s | Irregular |
+|-------|-------------|-----------|
+| BlockDoubleDelta | 0.13 B/row | 0.98 B/row |
+| DoubleDeltaVarInt+ZSTD | **0.01 B/row** | **0.36 B/row** |
+
+| Codec | Float Values |
+|-------|--------------|
+| BlockGorilla | 0.61 B/row |
+| GorillaV2+ZSTD | 0.61 B/row |
+
+| Codec | Series IDs |
+|-------|------------|
+| SeriesBlock | 0.16 B/row |
+| ZSTD alone | **0.13 B/row** |
+
+### Key Finding
+
+**Existing V3 codecs are OPTIMAL.** ZSTD's pattern recognition combined with domain-specific codecs beats pure bit-packing.
+
+### Why ZSTD Wins
+
+1. ZSTD recognizes repeating patterns across entire columns
+2. Varint encoding produces highly compressible byte streams
+3. Production ZSTD is highly optimized (SIMD, etc.)
+4. My bit-packing has overhead that exceeds savings
+
+### Files Modified
+
+| File | Changes |
+|------|---------|
+| `src/Compression/CompressionInfo.h` | Added method bytes 0x9f, 0xa0, 0xa1 |
+| `src/Compression/CompressionFactory.cpp` | Registered new codecs |
+| `CompressionCodecBlockDoubleDelta.cpp` | New codec (not recommended) |
+| `CompressionCodecBlockGorilla.cpp` | New codec (not recommended) |
+| `CompressionCodecSeriesBlock.cpp` | New codec (not recommended) |
+
+### Recommendation
+
+**Continue using V3 schema:**
+```sql
+id UInt64 CODEC(ZSTD(3))
+timestamp DateTime64(3) CODEC(DoubleDeltaVarInt, ZSTD(3))
+value Float64 CODEC(GorillaV2, ZSTD(3))
+```
+
+The new codecs are available but **not recommended** for production use.
+
+### Report Generated
+
+See `/Users/aj/clickhouse-otel-testing/COMPRESSION_REPORT-v3.md` for full analysis.
+
+---
+
+## Feature: Final Schema V4 - UUID with Optimized Codecs
+
+### Date: 2025-12-01
+
+### Summary
+
+Finalized the TimeSeries schema to use UUID (128-bit) for collision safety while maintaining excellent compression. Created V4 schema and comprehensive FINAL_REPORT.md.
+
+### Changes Made
+
+1. **Reverted Default ID to UUID**
+   - File: `src/Storages/TimeSeries/TimeSeriesDefinitionNormalizer.cpp`
+   - Changed from `UInt64` back to `UUID`
+   - Reason: 2.8% storage overhead is acceptable for 128-bit collision resistance
+
+2. **Created V4 Schema**
+   - File: `run/config/create_ts_inner_tables_config_v4.sql`
+   - UUID + ZSTD(3) for id
+   - DoubleDeltaVarInt + ZSTD(3) for timestamp
+   - GorillaV2 + ZSTD(3) for value
+
+3. **Generated Final Report**
+   - File: `FINAL_REPORT.md`
+   - Complete analysis of optimization journey
+   - Schema comparison V1 → V4
+   - VictoriaMetrics comparison
+   - Production recommendations
+
+### Final Compression Results
+
+| Schema | ID B/Row | TS B/Row | Val B/Row | Total |
+|--------|----------|----------|-----------|-------|
+| V4 (UUID) | 0.089 | 0.875 | 0.474 | **1.44** |
+| V3 (UInt64) | 0.052 | 0.875 | 0.474 | 1.40 |
+| VM | - | - | - | ~0.4 |
+
+### Key Insights
+
+1. **ZSTD compresses sorted UUIDs extremely well** (98.2% ratio)
+2. **Difference is only +2.8%** storage for 128-bit safety
+3. **ORDER BY (id, timestamp)** is critical for UUID compression
+4. **Production systems should use UUID** for collision resistance
+
+### Files Summary
+
+| File | Purpose |
+|------|---------|
+| `create_ts_inner_tables_config_v4.sql` | Final recommended schema |
+| `FINAL_REPORT.md` | Comprehensive optimization report |
+| `TimeSeriesDefinitionNormalizer.cpp` | Default codec configuration |
+
+### Recommendation
+
+**V4 Schema is the final recommendation:**
+```sql
+id UUID DEFAULT reinterpretAsUUID(sipHash128(metric_name, all_tags)) CODEC(ZSTD(3))
+timestamp DateTime64(3) CODEC(DoubleDeltaVarInt, ZSTD(3))
+value Float64 CODEC(GorillaV2, ZSTD(3))
+```
+
+Achieves **1.44 bytes/sample** with **128-bit collision safety**.
+

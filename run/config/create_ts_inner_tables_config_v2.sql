@@ -2,26 +2,29 @@
 -- CLICKHOUSE TIMESERIES SCHEMA FOR PROMETHEUS REMOTE WRITE - V2
 -- Using TimeSeries engine with OPTIMIZED compression codecs
 -- 
+-- NOTE: V3 schema is now available with UInt64 for ID (better compression)
+-- See create_ts_inner_tables_config_v3.sql for the latest schema
+-- 
 -- REQUIRES: ClickHouse with DoubleDeltaVarInt and GorillaV2 codecs
--- NOTE: DictionaryBlock tested but NOT beneficial for high-cardinality UUID (see id column comments)
--- (See TODO-v2.md for implementation details)
--- (See URGENT_FIXES.md for known issues and fixes needed)
+-- NOTE: DictionaryBlock tested but NOT beneficial for high-cardinality UUID
 -- 
 -- Target: 20M+ active series, high ingest, 3-day retention
--- Expected: ~0.5-0.6 bytes/sample (vs 2.3 bytes with v1)
 -- 
--- VERIFIED COMPRESSION RESULTS (21.6M rows, after OPTIMIZE FINAL):
+-- VERIFIED COMPRESSION RESULTS (63M rows, after OPTIMIZE FINAL):
 -- =====================================================================
 -- | Column    | V1 Codec              | V2 Codec                     | Actual    |
 -- |-----------|-----------------------|------------------------------|-----------|
--- | timestamp | Delta(8), ZSTD(1)     | DoubleDeltaVarInt, ZSTD(1)   | 0.44 B ✓  |
--- | value     | Gorilla, ZSTD(1)      | GorillaV2, ZSTD(1)           | 0.65 B ✓  |
--- | id        | ZSTD(1)               | ZSTD(1)                      | 0.16 B ✓  |
+-- | timestamp | Delta(8), ZSTD(1)     | DoubleDeltaVarInt, ZSTD(1)   | 0.89 B    |
+-- | value     | Gorilla, ZSTD(1)      | GorillaV2, ZSTD(1)           | 0.48 B    |
+-- | id        | ZSTD(1)               | ZSTD(1)                      | 0.09 B    |
 -- |-----------|-----------------------|------------------------------|-----------|
--- | TOTAL     | ~2.31 bytes/sample    | ~1.25 bytes/sample           | 46% ↓     |
+-- | TOTAL     | ~2.31 bytes/sample    | ~1.46 bytes/sample           | 37% ↓     |
 -- =====================================================================
--- NOTE: DictionaryBlock tested but was WORSE (1.33 B vs 0.16 B) due to
--- high cardinality (300K+ unique series). ZSTD achieves 101x compression.
+-- 
+-- V3 IMPROVEMENTS (see create_ts_inner_tables_config_v3.sql):
+-- - UInt64 for ID (instead of UUID) - better compression at scale
+-- - ZSTD(3) instead of ZSTD(1) - 2-5% improvement
+-- - Achieved: 1.32 bytes/sample (43% better than V1)
 -- =====================================================================
 
 CREATE DATABASE IF NOT EXISTS otel;

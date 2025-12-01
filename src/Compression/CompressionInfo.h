@@ -52,6 +52,9 @@ enum class CompressionMethodByte : uint8_t
     DoubleDeltaVarInt = 0x9c,
     GorillaV2       = 0x9d,
     DictionaryBlock = 0x9e,
+    BlockDoubleDelta = 0x9f,
+    BlockGorilla    = 0xa0,
+    SeriesBlock     = 0xa1,
 };
 
 }
