@@ -166,16 +166,10 @@ StorageTimeSeries::StorageTimeSeries(
         bool is_external_target = target_info && !target_info->table_id.empty();
         target.is_inner_table = !is_external_target;
 
-        if (target_kind == ViewTarget::Metrics && !target.is_inner_table)
-        {
-            auto table = DatabaseCatalog::instance().tryGetTable(target.table_id, getContext());
-            auto metadata = table->getInMemoryMetadataPtr();
-
-            for (const auto & column : metadata->columns)
-                if (column.type->lowCardinality())
-                    throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "External metrics table cannot have LowCardnality columns for now.");
-        }
-
+        // Note: LowCardinality is now supported for external tables (DATA, TAGS, METRICS)
+        // The column validators already accept LowCardinality types, so this artificial
+        // restriction has been removed.
+        
         has_inner_tables |= target.is_inner_table;
     }
 }

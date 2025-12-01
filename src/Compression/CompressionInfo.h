@@ -55,6 +55,9 @@ enum class CompressionMethodByte : uint8_t
     BlockDoubleDelta = 0x9f,
     BlockGorilla    = 0xa0,
     SeriesBlock     = 0xa1,
+    BitPackedTimestamp = 0xa2,
+    BitPackedGorilla = 0xa3,
+    SeriesBlockV2   = 0xa4,
 };
 
 }

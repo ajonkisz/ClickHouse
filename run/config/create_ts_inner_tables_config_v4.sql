@@ -140,6 +140,23 @@ DATA ENGINE = MergeTree
         max_suspicious_broken_parts = 5
 
 -- TAGS table: Stores metric name -> series ID mappings
+-- 
+-- INDEX RECOMMENDATIONS FOR PROMQL PERFORMANCE:
+-- 
+-- Without indexes, queries like {job="X"} require full table scans.
+-- ClickHouse supports these index types on Map columns:
+--
+--   1. bloom_filter on mapKeys(tags) - Fast "label exists?" checks
+--   2. tokenbf on mapValues(tags) - Substring matching on values  
+--   3. ngrambf - N-gram based fuzzy matching
+--
+-- Example (add inside TAGS ENGINE definition):
+--   INDEX idx_tags_keys mapKeys(tags) TYPE bloom_filter GRANULARITY 4,
+--   INDEX idx_tags_values mapValues(tags) TYPE tokenbf_v1(4096, 3, 0) GRANULARITY 4
+--
+-- Note: Currently NOT added by default as they increase write latency.
+-- Enable for read-heavy workloads.
+--
 TAGS ENGINE = AggregatingMergeTree
     PRIMARY KEY metric_name
     ORDER BY (metric_name, id)

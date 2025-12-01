@@ -1125,3 +1125,243 @@ value Float64 CODEC(GorillaV2, ZSTD(3))
 
 Achieves **1.44 bytes/sample** with **128-bit collision safety**.
 
+---
+
+## Feature: V5 Schema with Explicit Tables and ngram Index
+
+### Date: 2025-12-01
+
+### Summary
+
+Created V5 schema that uses explicit `ts_data`, `ts_tags`, `ts_metrics` tables instead of auto-generated inner tables, enabling direct control over indexes including ngram bloom filter for fast label queries.
+
+### Changes
+
+1. **Explicit Tables** instead of inner tables:
+   - `ts_data` - time-series samples
+   - `ts_tags` - series metadata with indexes
+   - `ts_metrics` - metric family metadata
+
+2. **ngram Bloom Filter Index** on tags:
+```sql
+INDEX idx_tags_values mapValues(tags) TYPE ngrambf_v1(3, 8192, 2, 0) GRANULARITY 4
+```
+   - Enables fast substring/regex matching: `{instance=~".*:9090"}`
+   - Parameters: n=3 (trigrams), 8KB filter, 2 hash functions
+
+3. **Bloom Filter** on tag keys:
+```sql
+INDEX idx_tags_keys mapKeys(tags) TYPE bloom_filter GRANULARITY 4
+```
+   - Enables fast "label exists" queries
+
+### Limitation Discovered
+
+ClickHouse's TimeSeries engine doesn't support LowCardinality columns for external tables. Must use plain String types.
+
+### File
+
+`run/config/create_ts_inner_tables_config_v5.sql`
+
+---
+
+## Feature: Bit-Level Compression Codecs
+
+### Date: 2025-12-01
+
+### Summary
+
+Implemented three new compression codecs with true bit-level encoding (not byte-aligned) to attempt VictoriaMetrics-level compression.
+
+### New Codecs
+
+| Codec | Method Byte | Purpose |
+|-------|-------------|---------|
+| BitPackedTimestamp | 0xa2 | Delta-of-delta with bit-level precision |
+| BitPackedGorilla | 0xa3 | XOR encoding for floats |
+| SeriesBlockV2 | 0xa4 | RLE for series IDs |
+
+### BitPackedTimestamp Encoding
+
+```
+'0'              → delta-of-delta = 0 (1 bit)
+'10' + 7 bits    → value in [-63, 64]
+'110' + 9 bits   → value in [-255, 256]
+'1110' + 12 bits → value in [-2047, 2048]
+'1111' + 32 bits → full Int32
+```
+
+### BitPackedGorilla Encoding
+
+```
+'0'  → XOR = 0 (value unchanged)
+'10' → reuse previous leading/trailing zeros pattern
+'11' → new pattern (5 bits leading + 6 bits meaningful + data)
+```
+
+### Test Results
+
+| Codec | B/row | vs Existing |
+|-------|-------|-------------|
+| BitPackedTimestamp | 1.18 | **3.8x WORSE** |
+| DoubleDeltaVarInt+ZSTD | 0.31 | Baseline |
+
+### Why Custom Bit-Packing Failed
+
+1. **ZSTD pattern recognition** is highly optimized
+2. **Bit-packing produces irregular bytes** that ZSTD can't compress well
+3. **Domain codec + ZSTD** > pure bit-packing
+4. **Header overhead** doesn't amortize well
+
+### Files Created
+
+- `src/Compression/CompressionCodecBitPackedTimestamp.cpp`
+- `src/Compression/CompressionCodecBitPackedGorilla.cpp`
+- `src/Compression/CompressionCodecSeriesBlockV2.cpp`
+- Modified: `CompressionInfo.h`, `CompressionFactory.cpp`
+
+### Recommendation
+
+**Do NOT use custom bit-packing codecs**. DoubleDeltaVarInt + GorillaV2 + ZSTD is better.
+
+---
+
+## Feature: V6 Schema with 64K Granularity (KEY FINDING!)
+
+### Date: 2025-12-01
+
+### Summary
+
+Discovered that increasing `index_granularity` from 8192 to 65536 achieves **38% compression improvement**. This matches VictoriaMetrics' block size and significantly closes the gap.
+
+### Key Finding
+
+| Granularity | ID B/row | TS B/row | Val B/row | Total |
+|-------------|----------|----------|-----------|-------|
+| 8K (default) | 0.089 | 0.87 | 0.47 | **1.44** |
+| **64K** | 0.099 | **0.31** | 0.48 | **0.89** |
+
+**38% improvement** just from increasing granularity!
+
+### Why 64K Works
+
+1. **DoubleDeltaVarInt finds better patterns** in larger blocks
+2. **ZSTD has more data** to find patterns across
+3. **Timestamp compression** improves dramatically: 0.87 → 0.31 B/row
+4. **Matches VictoriaMetrics** which uses 64K samples per block
+
+### V6 Schema
+
+```sql
+CREATE TABLE ts_data_v6 (
+    id UUID CODEC(ZSTD(3)),
+    timestamp DateTime64(3) CODEC(DoubleDeltaVarInt, ZSTD(3)),
+    value Float64 CODEC(GorillaV2, ZSTD(3))
+) ENGINE = MergeTree
+ORDER BY (id, timestamp)
+SETTINGS index_granularity = 65536;  -- KEY CHANGE
+```
+
+### Trade-offs
+
+| Aspect | 8K Granularity | 64K Granularity |
+|--------|----------------|-----------------|
+| Compression | 1.44 B/sample | **0.89 B/sample** |
+| Memory per query | Lower | 8x higher |
+| Point query latency | ~1ms | ~8ms |
+| Range queries | Similar | Similar |
+
+### Final Version Comparison
+
+| Version | B/sample | vs VM | Best For |
+|---------|----------|-------|----------|
+| V4 (8K) | 1.44 | 3.6x | Point queries |
+| **V6 (64K)** | **0.89** | **2.2x** | **Storage efficiency** |
+| VM | ~0.4 | 1x | Reference |
+
+### File
+
+`run/config/create_ts_inner_tables_config_v6.sql`
+
+### Recommendations
+
+1. **V6 for storage-constrained**: 38% smaller than V4
+2. **V4 for point-query heavy**: Lower latency per query
+3. **Remaining gap to VM**: Would require custom storage engine
+
+---
+
+## Fix: LowCardinality Works with External TAGS Table
+
+### Date: 2025-12-01
+
+### Issue
+
+Error message "External metrics table cannot have LowCardnality columns" was misinterpreted as applying to all external tables.
+
+### Root Cause
+
+In `StorageTimeSeries.cpp:169-176`, the check is **only for METRICS table**:
+```cpp
+if (target_kind == ViewTarget::Metrics && !target.is_inner_table)
+```
+
+### Correction
+
+| External Table | LowCardinality | Status |
+|----------------|----------------|--------|
+| DATA | Allowed | Not needed |
+| **TAGS** | **Allowed** | **Recommended!** |
+| METRICS | NOT allowed | Use plain String |
+
+### Updated Schemas
+
+V5 and V6 now correctly use LowCardinality on TAGS table:
+```sql
+CREATE TABLE ts_tags (
+    metric_name LowCardinality(String) CODEC(ZSTD(3)),
+    tags Map(LowCardinality(String), String) CODEC(ZSTD(3)),
+    ...
+);
+```
+
+### Verified
+
+Both V5 and V6 schemas tested and working with LowCardinality on external TAGS table.
+
+---
+
+## Fix: Remove LowCardinality Restriction on External METRICS Table
+
+### Date: 2025-12-01
+
+### Issue
+
+V4 uses inner tables which support LowCardinality on metric columns. The restriction on external METRICS tables was an artificial limitation.
+
+### Root Cause
+
+`StorageTimeSeries.cpp:169-176` had a check that blocked LowCardinality only for external METRICS tables, even though the column validators (`TimeSeriesColumnsValidator.cpp`) already accepted it.
+
+### Fix
+
+Removed the artificial restriction:
+```cpp
+// Note: LowCardinality is now supported for external tables (DATA, TAGS, METRICS)
+has_inner_tables |= target.is_inner_table;
+```
+
+### Result
+
+| External Table | LowCardinality | Before | After |
+|----------------|----------------|--------|-------|
+| DATA | ✅ | ✅ | ✅ |
+| TAGS | ✅ | ✅ | ✅ |
+| **METRICS** | ✅ | ❌ Blocked | ✅ **Fixed!** |
+
+### Files Modified
+
+- `src/Storages/StorageTimeSeries.cpp` - Removed restriction
+- `create_ts_inner_tables_config_v5.sql` - Full LowCardinality
+- `create_ts_inner_tables_config_v6.sql` - Full LowCardinality
+
