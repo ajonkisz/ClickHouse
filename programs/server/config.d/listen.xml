@@ -1,0 +1,5 @@
+<clickhouse>
+    <!-- Listen on all interfaces for Docker access -->
+    <listen_host>0.0.0.0</listen_host>
+</clickhouse>
+

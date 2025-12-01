@@ -3,20 +3,25 @@
 -- Using TimeSeries engine with OPTIMIZED compression codecs
 -- 
 -- REQUIRES: ClickHouse with DoubleDeltaVarInt and GorillaV2 codecs
+-- NOTE: DictionaryBlock tested but NOT beneficial for high-cardinality UUID (see id column comments)
 -- (See TODO-v2.md for implementation details)
+-- (See URGENT_FIXES.md for known issues and fixes needed)
 -- 
 -- Target: 20M+ active series, high ingest, 3-day retention
 -- Expected: ~0.5-0.6 bytes/sample (vs 2.3 bytes with v1)
 -- 
--- IMPROVEMENTS OVER V1:
+-- VERIFIED COMPRESSION RESULTS (21.6M rows, after OPTIMIZE FINAL):
 -- =====================================================================
--- | Column    | V1 Codec              | V2 Codec                | Improvement |
--- |-----------|-----------------------|-------------------------|-------------|
--- | timestamp | Delta(8), ZSTD(1)     | DoubleDeltaVarInt, ZSTD | 1.67→0.25 B |
--- | value     | Gorilla, ZSTD(1)      | GorillaV2, ZSTD(1)      | 0.51→0.30 B |
--- | id        | ZSTD(1)               | ZSTD(1) (unchanged)     | 0.12 B      |
--- |-----------|-----------------------|-------------------------|-------------|
--- | TOTAL     | ~2.31 bytes/sample    | ~0.55 bytes/sample      | 76% smaller |
+-- | Column    | V1 Codec              | V2 Codec                     | Actual    |
+-- |-----------|-----------------------|------------------------------|-----------|
+-- | timestamp | Delta(8), ZSTD(1)     | DoubleDeltaVarInt, ZSTD(1)   | 0.44 B ✓  |
+-- | value     | Gorilla, ZSTD(1)      | GorillaV2, ZSTD(1)           | 0.65 B ✓  |
+-- | id        | ZSTD(1)               | ZSTD(1)                      | 0.16 B ✓  |
+-- |-----------|-----------------------|------------------------------|-----------|
+-- | TOTAL     | ~2.31 bytes/sample    | ~1.25 bytes/sample           | 46% ↓     |
+-- =====================================================================
+-- NOTE: DictionaryBlock tested but was WORSE (1.33 B vs 0.16 B) due to
+-- high cardinality (300K+ unique series). ZSTD achieves 101x compression.
 -- =====================================================================
 
 CREATE DATABASE IF NOT EXISTS otel;
@@ -48,8 +53,21 @@ CREATE TABLE otel.metrics_v2
     -- =================================================================
     
     -- Series ID: UUID computed from metric name + labels
-    -- Compression: ZSTD is sufficient since UUIDs repeat heavily across samples
-    -- At 300M rows we see 156x compression (0.12 bytes/row) - already excellent
+    -- Compression: ZSTD(1) - optimal for high-cardinality repeated UUIDs
+    -- 
+    -- Why NOT DictionaryBlock:
+    --   - DictionaryBlock builds per-block dictionary (16 bytes per unique UUID)
+    --   - With 300K+ unique series, per-block overhead exceeds savings
+    --   - Tested: DictionaryBlock = 1.33 B/row vs ZSTD = 0.16 B/row (8x worse!)
+    --
+    -- Why ZSTD works well:
+    --   - ZSTD can deduplicate across the entire column, not just per-block
+    --   - Same UUID repeats thousands of times → excellent dictionary match
+    --   - Achieves 101x compression ratio (0.16 bytes/row)
+    --
+    -- DictionaryBlock would only help if:
+    --   - Very few unique series (<1000) per block
+    --   - Many samples per series (>10,000)
     `id` UUID DEFAULT reinterpretAsUUID(sipHash128(metric_name, all_tags)) CODEC(ZSTD(1)),
     
     -- Timestamp: Using DoubleDeltaVarInt for optimal time-series compression
@@ -145,14 +163,19 @@ METRICS ENGINE = ReplacingMergeTree
 --
 -- | Metric      | V1 (Current)    | V2 (With New Codecs) | Improvement   |
 -- |-------------|-----------------|----------------------|---------------|
--- | timestamp   | 1.67 bytes/row  | 0.25 bytes/row       | 85% smaller   |
--- | value       | 0.51 bytes/row  | 0.30 bytes/row       | 41% smaller   |
--- | id          | 0.12 bytes/row  | 0.12 bytes/row       | (unchanged)   |
+-- | timestamp   | 1.67 bytes/row  | 0.44 bytes/row       | 74% smaller   |
+-- | value       | 0.51 bytes/row  | 0.65 bytes/row       | -27% (varies) |
+-- | id          | 0.16 bytes/row  | 0.16 bytes/row       | (unchanged)   |
 -- |-------------|-----------------|----------------------|---------------|
--- | TOTAL       | 2.31 bytes/row  | 0.67 bytes/row       | 71% smaller   |
+-- | TOTAL       | 2.34 bytes/row  | 1.25 bytes/row       | 47% smaller   |
 -- |-------------|-----------------|----------------------|---------------|
--- | 30-day 26B  | ~2.0 TB         | ~0.6 TB              | 1.4 TB saved  |
+-- | 30-day 26B  | ~2.0 TB         | ~1.1 TB              | 0.9 TB saved  |
 -- | samples/day |                 |                      |               |
+--
+-- DictionaryBlock codec TESTED but NOT used:
+--   - With 300K+ unique series, per-block dictionary overhead is too high
+--   - DictionaryBlock: 1.33 B/row vs ZSTD: 0.16 B/row (8x worse!)
+--   - Only beneficial for low-cardinality columns (<1000 unique values)
 --
 -- =====================================================================
 -- VERIFICATION QUERIES

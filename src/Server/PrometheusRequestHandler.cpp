@@ -224,31 +224,62 @@ public:
     void handlingRequestWithContext([[maybe_unused]] HTTPServerRequest & request, [[maybe_unused]] HTTPServerResponse & response) override
     {
 #if USE_PROMETHEUS_PROTOBUFS
-        checkHTTPHeader(request, "Content-Type", "application/x-protobuf");
-        checkHTTPHeader(request, "Content-Encoding", "snappy");
-
-
-        prometheus::WriteRequest write_request;
-
+        try
         {
-            ProtobufZeroCopyInputStreamFromReadBuffer zero_copy_input_stream{
-                std::make_unique<SnappyReadBuffer>(wrapReadBufferPointer(request.getStream()))};
+            checkHTTPHeader(request, "Content-Type", "application/x-protobuf");
+            checkHTTPHeader(request, "Content-Encoding", "snappy");
 
-            if (!write_request.ParsePartialFromZeroCopyStream(&zero_copy_input_stream))
-                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Cannot parse WriteRequest");
+
+            prometheus::WriteRequest write_request;
+
+            {
+                ProtobufZeroCopyInputStreamFromReadBuffer zero_copy_input_stream{
+                    std::make_unique<SnappyReadBuffer>(wrapReadBufferPointer(request.getStream()))};
+
+                if (!write_request.ParsePartialFromZeroCopyStream(&zero_copy_input_stream))
+                    throw Exception(ErrorCodes::BAD_ARGUMENTS, "Cannot parse WriteRequest");
+            }
+
+            auto table = DatabaseCatalog::instance().getTable(StorageID{config().time_series_table_name}, context);
+            PrometheusRemoteWriteProtocol protocol{table, context};
+
+            if (write_request.timeseries_size())
+                protocol.writeTimeSeries(write_request.timeseries());
+
+            if (write_request.metadata_size())
+                protocol.writeMetricsMetadata(write_request.metadata());
+
+            response.setStatusAndReason(Poco::Net::HTTPResponse::HTTPStatus::HTTP_NO_CONTENT, Poco::Net::HTTPResponse::HTTP_REASON_NO_CONTENT);
+            response.setChunkedTransferEncoding(false);
         }
-
-        auto table = DatabaseCatalog::instance().getTable(StorageID{config().time_series_table_name}, context);
-        PrometheusRemoteWriteProtocol protocol{table, context};
-
-        if (write_request.timeseries_size())
-            protocol.writeTimeSeries(write_request.timeseries());
-
-        if (write_request.metadata_size())
-            protocol.writeMetricsMetadata(write_request.metadata());
-
-        response.setStatusAndReason(Poco::Net::HTTPResponse::HTTPStatus::HTTP_NO_CONTENT, Poco::Net::HTTPResponse::HTTP_REASON_NO_CONTENT);
-        response.setChunkedTransferEncoding(false);
+        catch (const Exception & e)
+        {
+            LOG_ERROR(log(), "Remote write error: {}", e.displayText());
+            response.setStatusAndReason(Poco::Net::HTTPResponse::HTTP_INTERNAL_SERVER_ERROR);
+            response.setContentType("text/plain");
+            writeString(e.message(), getOutputStream(response));
+        }
+        catch (const Poco::Exception & e)
+        {
+            LOG_ERROR(log(), "Remote write Poco exception: {}", e.displayText());
+            response.setStatusAndReason(Poco::Net::HTTPResponse::HTTP_INTERNAL_SERVER_ERROR);
+            response.setContentType("text/plain");
+            writeString(e.message(), getOutputStream(response));
+        }
+        catch (const std::exception & e)
+        {
+            LOG_ERROR(log(), "Remote write std exception: {}", e.what());
+            response.setStatusAndReason(Poco::Net::HTTPResponse::HTTP_INTERNAL_SERVER_ERROR);
+            response.setContentType("text/plain");
+            writeString(e.what(), getOutputStream(response));
+        }
+        catch (...)
+        {
+            LOG_ERROR(log(), "Remote write unknown exception");
+            response.setStatusAndReason(Poco::Net::HTTPResponse::HTTP_INTERNAL_SERVER_ERROR);
+            response.setContentType("text/plain");
+            writeString("Unknown error during remote write", getOutputStream(response));
+        }
 
 #else
         throw Exception(ErrorCodes::SUPPORT_IS_DISABLED, "Prometheus remote write protocol is disabled");
@@ -339,7 +370,8 @@ public:
 
         /// Some parameters (database, default_format, everything used in the code above) do not
         /// belong to the Settings class.
-        static const NameSet reserved_param_names{"user", "password", "query", "time", "start", "end", "step"};
+        /// Note: "match[]" is the Prometheus series selector parameter
+        static const NameSet reserved_param_names{"user", "password", "query", "time", "start", "end", "step", "match[]", "limit"};
         return !reserved_param_names.contains(name);
     }
 
@@ -446,6 +478,7 @@ public:
         }
         catch (const Exception & e)
         {
+            LOG_ERROR(log(), "PromQL query DB::Exception: {}", e.displayText());
             response.setStatusAndReason(Poco::Net::HTTPResponse::HTTP_BAD_REQUEST);
             String error_str;
             WriteBufferFromString error_buf(error_str);
@@ -454,8 +487,36 @@ public:
             writeString(R"("})", error_buf);
             error_buf.finalize();
             writeString(error_str, getOutputStream(response));
-
-            LOG_ERROR(log(), "Error executing query: {}", e.displayText());
+        }
+        catch (const Poco::Exception & e)
+        {
+            LOG_ERROR(log(), "PromQL query Poco::Exception: {}", e.displayText());
+            response.setStatusAndReason(Poco::Net::HTTPResponse::HTTP_INTERNAL_SERVER_ERROR);
+            String error_str;
+            WriteBufferFromString error_buf(error_str);
+            writeString(R"({"status":"error","errorType":"internal","error":")", error_buf);
+            writeString(e.message(), error_buf);
+            writeString(R"("})", error_buf);
+            error_buf.finalize();
+            writeString(error_str, getOutputStream(response));
+        }
+        catch (const std::exception & e)
+        {
+            LOG_ERROR(log(), "PromQL query std::exception: {}", e.what());
+            response.setStatusAndReason(Poco::Net::HTTPResponse::HTTP_INTERNAL_SERVER_ERROR);
+            String error_str;
+            WriteBufferFromString error_buf(error_str);
+            writeString(R"({"status":"error","errorType":"internal","error":")", error_buf);
+            writeString(e.what(), error_buf);
+            writeString(R"("})", error_buf);
+            error_buf.finalize();
+            writeString(error_str, getOutputStream(response));
+        }
+        catch (...)
+        {
+            LOG_ERROR(log(), "PromQL query unknown exception");
+            response.setStatusAndReason(Poco::Net::HTTPResponse::HTTP_INTERNAL_SERVER_ERROR);
+            writeString(R"({"status":"error","errorType":"internal","error":"Unknown error"})", getOutputStream(response));
         }
     }
 };

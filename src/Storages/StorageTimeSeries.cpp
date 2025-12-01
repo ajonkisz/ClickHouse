@@ -427,7 +427,7 @@ void StorageTimeSeries::restoreDataFromBackup(RestorerFromBackup & restorer, con
 void StorageTimeSeries::read(
     QueryPlan & query_plan,
     const Names & column_names,
-    const StorageSnapshotPtr & storage_snapshot,
+    const StorageSnapshotPtr & /* storage_snapshot */,
     SelectQueryInfo & query_info,
     ContextPtr local_context,
     QueryProcessingStage::Enum processed_stage,

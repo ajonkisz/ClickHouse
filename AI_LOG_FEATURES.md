@@ -519,3 +519,371 @@ absent(nonexistent_metric{job="test"})
 sort(sum by (instance)(rate(http_requests_total[5m])))
 ```
 
+---
+
+## Latest Session: Error Handling & Stability Fixes
+
+### Date: 2025-11-30
+
+### Problem Statement
+
+Testing revealed critical stability issues where the ClickHouse server would crash with SIGABRT when processing certain requests. The issues occurred in:
+1. PromQL query processing errors
+2. Remote write under concurrent load
+3. Labels/Series/LabelValues endpoint failures
+
+### Root Cause
+
+Exceptions thrown during request handling were not being caught properly, allowing them to propagate up the call stack and trigger `abort()`.
+
+### Fixes Implemented
+
+#### 1. Remote Write Handler (`src/Server/PrometheusRequestHandler.cpp`)
+
+**Before:** No exception handling around remote write processing.
+
+**After:** Comprehensive try-catch block in `RemoteWriteImpl::handlingRequestWithContext()`:
+
+```cpp
+void handlingRequestWithContext(HTTPServerRequest & request, HTTPServerResponse & response) override
+{
+    try
+    {
+        // ... protobuf parsing and insertion ...
+        response.setStatusAndReason(HTTP_NO_CONTENT);
+    }
+    catch (const Exception & e)
+    {
+        LOG_ERROR(log(), "Remote write error: {}", e.displayText());
+        response.setStatusAndReason(HTTP_INTERNAL_SERVER_ERROR);
+        writeString(e.message(), getOutputStream(response));
+    }
+    catch (const Poco::Exception & e) { /* similar handling */ }
+    catch (const std::exception & e) { /* similar handling */ }
+    catch (...) { /* generic handling */ }
+}
+```
+
+#### 2. Query API Handler (`src/Server/PrometheusRequestHandler.cpp`)
+
+**Before:** Only caught `DB::Exception`.
+
+**After:** Extended `QueryAPIImpl::handlingRequestWithContext()` to catch all exception types with proper JSON error responses:
+
+```cpp
+catch (const Exception & e) {
+    // HTTP 400, errorType: "bad_data"
+}
+catch (const Poco::Exception & e) {
+    // HTTP 500, errorType: "internal"
+}
+catch (const std::exception & e) {
+    // HTTP 500, errorType: "internal"
+}
+catch (...) {
+    // HTTP 500, errorType: "internal", "Unknown error"
+}
+```
+
+#### 3. PromQL Query Execution (`src/Storages/TimeSeries/PrometheusHTTPProtocolAPI.cpp`)
+
+**Before:** Exceptions during query processing propagated up.
+
+**After:** Multi-level error handling in `executePromQLQuery()`:
+
+| Stage | Error Handling |
+|-------|---------------|
+| Query validation | Empty query check with JSON error response |
+| PromQL parsing | Try-catch with descriptive error message |
+| Parameter parsing | Try-catch for timestamp/step parsing |
+| SQL conversion | Try-catch for converter failures |
+| Query execution | Try-catch wrapping `executeQuery()` and result processing |
+
+Example:
+```cpp
+try {
+    query_tree->parse(params.promql_query);
+} catch (const Exception & e) {
+    writeString(R"({"status":"error","errorType":"bad_data","error":"..."})", response);
+    return;  // Don't throw!
+}
+```
+
+#### 4. Labels/Series/LabelValues Endpoints (`src/Storages/TimeSeries/PrometheusHTTPProtocolAPI.cpp`)
+
+**Before:** SQL errors (e.g., table doesn't exist) would crash the server.
+
+**After:** Each function wrapped in try-catch:
+
+- `getSeries()` → Returns JSON error on failure
+- `getLabels()` → Returns JSON error on failure  
+- `getLabelValues()` → Returns JSON error on failure
+
+### Error Response Format
+
+All Prometheus API errors now return Prometheus-compatible JSON:
+
+```json
+{
+  "status": "error",
+  "errorType": "bad_data|internal",
+  "error": "descriptive error message"
+}
+```
+
+### Files Modified
+
+| File | Changes |
+|------|---------|
+| `src/Server/PrometheusRequestHandler.cpp` | Added exception handling to `RemoteWriteImpl` and extended `QueryAPIImpl` |
+| `src/Storages/TimeSeries/PrometheusHTTPProtocolAPI.cpp` | Added try-catch to `executePromQLQuery()`, `getSeries()`, `getLabels()`, `getLabelValues()` |
+| `src/Storages/StorageTimeSeries.cpp` | Fixed unused parameter warning (`storage_snapshot`) |
+
+### Testing
+
+```bash
+# These should return JSON errors instead of crashing:
+curl "http://localhost:9363/api/v1/query?query="  # Empty query
+curl "http://localhost:9363/api/v1/query?query=invalid{{{syntax"  # Parse error
+curl "http://localhost:9363/api/v1/labels"  # When table doesn't exist
+curl "http://localhost:9363/api/v1/series?match[]=nonexistent"  # No matching series
+
+# Remote write errors should return HTTP 500 with message, not crash
+```
+
+### Impact
+
+- **Server stability**: No more SIGABRT crashes on malformed requests
+- **Grafana compatibility**: Proper error responses displayed in UI
+- **Debugging**: All errors logged with `LOG_ERROR` before response
+- **Graceful degradation**: Individual requests fail without affecting server
+
+---
+
+## Latest Session: Critical Fixes for PromQL Endpoint Crashes
+
+### Date: 2025-12-01
+
+### Problem Statement
+
+After previous error handling fixes, the server was still crashing with SIGABRT when calling:
+- `/api/v1/labels` 
+- `/api/v1/series`
+- `/api/v1/label/<name>/values`
+- `/api/v1/query` and `/api/v1/query_range`
+
+The crash happened inside `executeQueryImpl()` even when try-catch blocks were in place.
+
+### Root Causes Identified
+
+#### 1. Context Not Properly Isolated
+
+**Problem:** Using `getContext()` directly and calling `makeQueryContext()` on it was modifying the shared context, causing issues.
+
+**Solution:** Use `Context::createCopy()` to create an isolated copy:
+
+```cpp
+// Before (problematic):
+auto query_context = getContext();
+query_context->makeQueryContext();
+
+// After (fixed):
+auto query_context = Context::createCopy(getContext());
+query_context->makeQueryContext();
+```
+
+#### 2. Internal Query Flag Not Set
+
+**Problem:** Executing internal SQL queries without the `internal` flag triggered process list assertions.
+
+**Solution:** Set `QueryFlags{.internal = true}` when calling `executeQuery()`:
+
+```cpp
+// Before:
+auto [ast, io] = executeQuery(sql, query_context, {}, QueryProcessingStage::Complete);
+
+// After:
+auto [ast, io] = executeQuery(sql, query_context, QueryFlags{.internal = true}, QueryProcessingStage::Complete);
+```
+
+#### 3. Wrong Table Name Construction
+
+**Problem:** Labels/series/label-values endpoints were constructing table names as `database.table_tags` instead of using the actual inner table ID.
+
+**Solution:** Use `getTargetTableId()` to get the correct table ID:
+
+```cpp
+// Before (wrong):
+String tags_table = storage_id.database_name + "." + storage_id.table_name + "_tags";
+
+// After (correct):
+auto tags_table_id = time_series_storage->getTargetTableId(ViewTarget::Tags);
+String tags_table = backQuoteIfNeed(tags_table_id.database_name) + "." + backQuoteIfNeed(tags_table_id.table_name);
+```
+
+#### 4. Querying EPHEMERAL Columns
+
+**Problem:** Queries were trying to SELECT from `all_tags` which is an EPHEMERAL column (not stored).
+
+**Solution:** Use the `tags` column instead:
+
+```cpp
+// Before (wrong - all_tags is EPHEMERAL):
+String sql = fmt::format("SELECT DISTINCT arrayJoin(mapKeys(all_tags)) as label_name FROM {} ", tags_table);
+
+// After (correct - use tags):
+String sql = fmt::format("SELECT DISTINCT arrayJoin(mapKeys(tags)) as label_name FROM {} ", tags_table);
+```
+
+#### 5. Experimental Setting Not Enabled
+
+**Problem:** PromQL queries use `timeSeriesResampleToGridWithStaleness` aggregate function which requires `allow_experimental_time_series_aggregate_functions = 1`.
+
+**Solution:** Add setting to user profile configuration (`programs/server/users.d/enable_features.xml`):
+
+```xml
+<clickhouse>
+    <profiles>
+        <default>
+            <allow_experimental_time_series_table>1</allow_experimental_time_series_table>
+            <allow_experimental_window_view>1</allow_experimental_window_view>
+            <allow_experimental_time_series_aggregate_functions>1</allow_experimental_time_series_aggregate_functions>
+        </default>
+    </profiles>
+</clickhouse>
+```
+
+### Files Modified
+
+| File | Changes |
+|------|---------|
+| `src/Storages/TimeSeries/PrometheusHTTPProtocolAPI.cpp` | Fixed context creation, query flags, table names, and column names |
+| `programs/server/config.d/enable_features.xml` | Added experimental aggregate functions setting |
+| `programs/server/users.d/enable_features.xml` | Added experimental aggregate functions setting (user profile) |
+
+### Verification
+
+After fixes, all endpoints work without crashing:
+
+```bash
+# Labels endpoint - WORKING
+curl "http://localhost:9363/api/v1/labels"
+# Returns: {"status":"success","data":["__name__","host","job",...]}
+
+# PromQL query - WORKING (no crash, returns results based on data)
+curl "http://localhost:9363/api/v1/query?query=http_requests_total"
+# Returns: {"status":"success","data":{}} or actual results
+
+# Server remains stable under all query types
+```
+
+### Summary of All Changes
+
+1. **`Context::createCopy(getContext())`** - Isolate query context
+2. **`QueryFlags{.internal = true}`** - Mark as internal query
+3. **`getTargetTableId(ViewTarget::Tags)`** - Get correct inner table name
+4. **`tags` instead of `all_tags`** - Query stored columns
+5. **User profile settings** - Enable experimental aggregate functions
+
+### Known Limitations
+
+- PromQL instant queries may return empty results if no data matches the time filter
+- The `match[]` parameter for series endpoint needs URL encoding (`%5B%5D`)
+- Complex PromQL expressions depend on PrometheusQueryToSQL converter implementation
+
+---
+
+## Session: Final Endpoint Fixes - Label Values and Series
+
+### Date: 2025-12-01
+
+### Issues Fixed
+
+#### 1. Label Values Endpoint Not Registered
+
+**Problem:** Requests to `/api/v1/label/job/values` returned "There is no handle" error.
+
+**Root Cause:** The wildcard URL `/api/v1/label/*/values` in config wasn't matching because HTTP URL filters don't support simple wildcards.
+
+**Solution:** Use regex pattern instead:
+
+```xml
+<!-- Before (not working): -->
+<url>/api/v1/label/*/values</url>
+
+<!-- After (working): -->
+<url>regex:/api/v1/label/[^/]+/values</url>
+```
+
+**Files Modified:**
+- `programs/server/config.d/prometheus_protocol.xml`
+- `run/config/prometheus_protocol.xml`
+
+#### 2. Series Endpoint match[] Parameter Error
+
+**Problem:** Requests to `/api/v1/series?match[]=metric` failed with "Setting match[] is neither a builtin setting".
+
+**Root Cause:** The `match[]` parameter wasn't in the reserved parameter list, so ClickHouse tried to interpret it as a settings parameter.
+
+**Solution:** Add `match[]` and `limit` to reserved parameters:
+
+```cpp
+// Before:
+static const NameSet reserved_param_names{"user", "password", "query", "time", "start", "end", "step"};
+
+// After:
+static const NameSet reserved_param_names{"user", "password", "query", "time", "start", "end", "step", "match[]", "limit"};
+```
+
+**Files Modified:**
+- `src/Server/PrometheusRequestHandler.cpp`
+
+### Verification Results
+
+All endpoints now working:
+
+```bash
+# Labels endpoint
+curl "http://localhost:9363/api/v1/labels"
+# {"status":"success","data":["__name__","host","job",...]} ✅
+
+# Label values endpoint  
+curl "http://localhost:9363/api/v1/label/job/values"
+# {"status":"success","data":["metrics-generator"]} ✅
+
+curl "http://localhost:9363/api/v1/label/__name__/values"
+# {"status":"success","data":["cpu_usage_percent","memory_bytes",...]} ✅
+
+# Series endpoint
+curl "http://localhost:9363/api/v1/series?match%5B%5D=cpu_usage_percent"
+# {"status":"success","data":[{"__name__":"cpu_usage_percent",...},...]} ✅
+
+# PromQL queries
+curl "http://localhost:9363/api/v1/query?query=cpu_usage_percent"
+# {"status":"success","data":{...}} ✅
+
+curl "http://localhost:9363/api/v1/query_range?query=cpu_usage_percent&start=...&end=...&step=60"
+# {"status":"success","data":{"resultType":"matrix","result":[...]}} ✅
+```
+
+### Complete Endpoint Status
+
+| Endpoint | Method | Status | Notes |
+|----------|--------|--------|-------|
+| `/write` | POST | ✅ | Prometheus remote write |
+| `/read` | POST | ✅ | Prometheus remote read |
+| `/api/v1/query` | GET | ✅ | PromQL instant query |
+| `/api/v1/query_range` | GET | ✅ | PromQL range query |
+| `/api/v1/labels` | GET | ✅ | List all label names |
+| `/api/v1/label/{name}/values` | GET | ✅ | List values for label |
+| `/api/v1/series` | GET | ✅ | List matching series |
+| `/metrics` | GET | ✅ | ClickHouse internal metrics |
+
+### Grafana Compatibility
+
+All endpoints required for Grafana's Prometheus data source are now functional:
+- ✅ Query editor autocomplete (labels, label values)
+- ✅ Metrics browser (series)
+- ✅ Graph panels (query, query_range)
+- ✅ Variable dropdowns (label values)
+
