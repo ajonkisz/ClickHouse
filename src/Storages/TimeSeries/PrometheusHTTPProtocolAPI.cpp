@@ -5,6 +5,7 @@
 #include <Common/logger_useful.h>
 #include <Common/quoteString.h>
 #include <Common/thread_local_rng.h>
+#include <Common/Stopwatch.h>
 #include <Core/Field.h>
 #include <IO/WriteBufferFromString.h>
 #include <IO/WriteHelpers.h>
@@ -54,6 +55,9 @@ void PrometheusHTTPProtocolAPI::executePromQLQuery(
     WriteBuffer & response,
     const Params & params)
 {
+    Stopwatch total_watch;
+    Stopwatch watch;
+    
     /// Validate query parameter first
     if (params.promql_query.empty())
     {
@@ -81,7 +85,10 @@ void PrometheusHTTPProtocolAPI::executePromQLQuery(
         return;
     }
 
-    LOG_TRACE(log, "Parsed PromQL query: {}. Result type: {}", params.promql_query, query_tree->getResultType());
+    UInt64 parse_time_ms = watch.elapsedMilliseconds();
+    watch.restart();
+    
+    LOG_TRACE(log, "Parsed PromQL query: {}. Result type: {}. Parse time: {}ms", params.promql_query, query_tree->getResultType(), parse_time_ms);
 
     // Create TimeSeriesTableInfo structure
     PrometheusQueryToSQLConverter::TimeSeriesTableInfo table_info;
@@ -152,6 +159,12 @@ void PrometheusHTTPProtocolAPI::executePromQLQuery(
         return;
     }
 
+    UInt64 conversion_time_ms = watch.elapsedMilliseconds();
+    watch.restart();
+    
+    String sql_string = sql_query->formatWithSecretsOneLine();
+    LOG_DEBUG(log, "Converted PromQL to SQL in {}ms. SQL: {}", conversion_time_ms, sql_string);
+
     /// Create a copy of the context for query execution to avoid modifying the original
     auto query_context = Context::createCopy(getContext());
     query_context->makeQueryContext();
@@ -161,35 +174,46 @@ void PrometheusHTTPProtocolAPI::executePromQLQuery(
     try
     {
         /// Execute as internal query to prevent assertions in some edge cases
-        auto [ast, io] = executeQuery(sql_query->formatWithSecretsOneLine(), query_context, QueryFlags{.internal = true}, QueryProcessingStage::Complete);
+        auto [ast, io] = executeQuery(sql_string, query_context, QueryFlags{.internal = true}, QueryProcessingStage::Complete);
+
+        UInt64 prepare_time_ms = watch.elapsedMilliseconds();
+        watch.restart();
 
         PullingPipelineExecutor executor(io.pipeline);
         Block result_block;
+
+        size_t total_rows = 0;
 
         /// Mind using the getResultType() method from PrometheusQueryToSQLConverter, not from the PrometheusQueryTree.
         if (converter.getResultType() == PrometheusQueryTree::ResultType::RANGE_VECTOR)
         {
             writeRangeQueryHeader(response);
             while (executor.pull(result_block))
+            {
+                total_rows += result_block.rows();
                 writeRangeQueryResponse(response, result_block);
+            }
             writeRangeQueryFooter(response);
-            return;
         }
         else if (converter.getResultType() == PrometheusQueryTree::ResultType::INSTANT_VECTOR)
         {
             writeInstantQueryHeader(response);
             while (executor.pull(result_block))
+            {
+                total_rows += result_block.rows();
                 writeInstantQueryResponse(response, result_block);
+            }
             writeInstantQueryFooter(response);
-            return;
         }
         else if (converter.getResultType() == PrometheusQueryTree::ResultType::SCALAR)
         {
             writeInstantQueryHeader(response);
             while (executor.pull(result_block))
+            {
+                total_rows += result_block.rows();
                 writeScalarQueryResponse(response, result_block);
+            }
             writeInstantQueryFooter(response);
-            return;
         }
         else
         {
@@ -197,6 +221,13 @@ void PrometheusHTTPProtocolAPI::executePromQLQuery(
             writeString(R"({"status":"error","errorType":"internal","error":"Unsupported result type"})", response);
             return;
         }
+        
+        UInt64 execution_and_format_time_ms = watch.elapsedMilliseconds();
+        UInt64 total_time_ms = total_watch.elapsedMilliseconds();
+        
+        LOG_INFO(log, "PromQL query '{}' completed in {}ms (parse: {}ms, convert: {}ms, prepare: {}ms, exec+format: {}ms, rows: {})", 
+                 params.promql_query, total_time_ms, parse_time_ms, conversion_time_ms, prepare_time_ms, execution_and_format_time_ms, total_rows);
+        return;
     }
     catch (const Exception & e)
     {
