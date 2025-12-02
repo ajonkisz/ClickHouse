@@ -6,9 +6,13 @@
 #include <Common/quoteString.h>
 #include <Common/thread_local_rng.h>
 #include <Common/Stopwatch.h>
-#include <Core/Field.h>
+#include <Formats/FormatSettings.h>
 #include <IO/WriteBufferFromString.h>
+#include <IO/WriteBufferFromFile.h>
+#include <Core/Field.h>
 #include <IO/WriteHelpers.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <Parsers/ASTViewTargets.h>
 #include <Storages/StorageTimeSeries.h>
 #include <Parsers/Prometheus/PrometheusQueryTree.h>
@@ -224,6 +228,27 @@ void PrometheusHTTPProtocolAPI::executePromQLQuery(
         
         UInt64 execution_and_format_time_ms = watch.elapsedMilliseconds();
         UInt64 total_time_ms = total_watch.elapsedMilliseconds();
+        
+        // Write timing details to file for analysis
+        try
+        {
+            String timing_file = "/tmp/clickhouse_promql_timings.log";
+            WriteBufferFromFile timing_buf(timing_file, DBMS_DEFAULT_BUFFER_SIZE, O_APPEND | O_CREAT | O_WRONLY);
+            writeString(fmt::format("{}|{}|{}|{}|{}|{}|{}|{}\n",
+                time(nullptr),
+                params.promql_query,
+                total_time_ms,
+                parse_time_ms,
+                conversion_time_ms,
+                prepare_time_ms,
+                execution_and_format_time_ms,
+                total_rows), timing_buf);
+            timing_buf.finalize();
+        }
+        catch (...)
+        {
+            // Ignore timing file errors
+        }
         
         LOG_INFO(log, "PromQL query '{}' completed in {}ms (parse: {}ms, convert: {}ms, prepare: {}ms, exec+format: {}ms, rows: {})", 
                  params.promql_query, total_time_ms, parse_time_ms, conversion_time_ms, prepare_time_ms, execution_and_format_time_ms, total_rows);
@@ -735,72 +760,84 @@ void DB::PrometheusHTTPProtocolAPI::writeScalarResult(WriteBuffer & response, co
 
 void DB::PrometheusHTTPProtocolAPI::writeVectorResult(WriteBuffer & response, const Block & result_block)
 {
-    writeString("[", response);
+    // Optimized: Batch entire result in memory buffer, then write once to reduce overhead
+    WriteBufferFromOwnString temp_buffer;
+    WriteBuffer & buf = temp_buffer;
+    FormatSettings json_settings;
+
+    writeChar('[', buf);
 
     if (!result_block.empty() && result_block.rows() > 0)
     {
         for (size_t i = 0; i < result_block.rows(); ++i)
         {
             if (i > 0)
-                writeString(",", response);
+                writeChar(',', buf);
 
-            writeString("{", response);
+            writeChar('{', buf);
 
             // Write metric labels
-            writeString(R"("metric":)", response);
-            writeMetricLabels(response, result_block, i);
+            writeString(R"("metric":)", buf);
+            writeMetricLabels(buf, result_block, i);
 
-            writeString(",", response);
+            writeChar(',', buf);
 
             // Write value [timestamp, "value"]
-            writeString("\"value\":[", response);
+            writeString(R"("value":[)", buf);
 
             // Write timestamp
             if (result_block.has(TimeSeriesColumnNames::Timestamp))
             {
                 const auto & ts_column = result_block.getByName(TimeSeriesColumnNames::Timestamp).column;
                 auto timestamp = ts_column->getFloat64(i);
-                writeFloatText(std::round(timestamp * 100.0) / 100.0, response);
+                writeFloatText(std::round(timestamp * 100.0) / 100.0, buf);
             }
             else
             {
-                writeFloatText(std::round(time(nullptr) * 100.0) / 100.0, response);
+                writeFloatText(std::round(time(nullptr) * 100.0) / 100.0, buf);
             }
 
-            writeString(",", response);
+            writeChar(',', buf);
 
             // Write value
             if (result_block.has(TimeSeriesColumnNames::Value))
             {
                 const auto & value_column = result_block.getByName(TimeSeriesColumnNames::Value).column;
                 auto value = value_column->getFloat64(i);
-                writeString("\"", response);
-                writeFloatText(std::round(value * 100.0) / 100.0, response);
-                writeString("\"", response);
+                writeChar('"', buf);
+                writeFloatText(std::round(value * 100.0) / 100.0, buf);
+                writeChar('"', buf);
             }
             else if (result_block.has(TimeSeriesColumnNames::Scalar))
             {
                 const auto & scalar_column = result_block.getByName(TimeSeriesColumnNames::Scalar).column;
                 auto value = scalar_column->getFloat64(i);
-                writeString("\"", response);
-                writeFloatText(std::round(value * 100.0) / 100.0, response);
-                writeString("\"", response);
+                writeChar('"', buf);
+                writeFloatText(std::round(value * 100.0) / 100.0, buf);
+                writeChar('"', buf);
             }
             else
             {
-                writeString("\"0\"", response);
+                writeString(R"("0")", buf);
             }
 
-            writeString("]}", response);
+            writeString("]}", buf);
         }
     }
 
-    writeString("]", response);
+    writeChar(']', buf);
+    buf.finalize();
+    
+    // Write the entire accumulated JSON in one call - this is the key optimization
+    writeString(temp_buffer.str(), response);
 }
 
 void DB::PrometheusHTTPProtocolAPI::writeMetricLabels(WriteBuffer & response, const Block & result_block, size_t row_index)
 {
-    writeString("{", response);
+    // Optimized: Use writeJSONString for proper escaping and batch operations
+    FormatSettings json_settings;
+
+    writeChar('{', response);
 
     if (result_block.has(TimeSeriesColumnNames::Tags))
     {
@@ -819,23 +856,23 @@ void DB::PrometheusHTTPProtocolAPI::writeMetricLabels(WriteBuffer & response, co
                 bool first = true;
                 for (size_t j = start; j < end; ++j)
                 {
-                    String key{key_column.getDataAt(j)};
-
                     if (!first)
-                        writeString(",", response);
+                        writeChar(',', response);
                     first = false;
 
-                    writeString("\"", response);
-                    writeString(key, response);
-                    writeString("\":\"", response);
-                    writeString(value_column.getDataAt(j), response);
-                    writeString("\"", response);
+                    // Use writeJSONString for proper escaping and efficiency
+                    auto key_data = key_column.getDataAt(j);
+                    writeJSONString(key_data, response, json_settings);
+                    writeChar(':', response);
+                    
+                    auto value_data = value_column.getDataAt(j);
+                    writeJSONString(value_data, response, json_settings);
                 }
             }
         }
     }
 
-    writeString("}", response);
+    writeChar('}', response);
 }
 
 void DB::PrometheusHTTPProtocolAPI::writeRangeQueryHeader(WriteBuffer & response)
