@@ -9,6 +9,7 @@
 #include <Formats/FormatSettings.h>
 #include <IO/WriteBufferFromString.h>
 #include <IO/WriteBufferFromFile.h>
+#include <IO/ReadBufferFromString.h>
 #include <Core/Field.h>
 #include <IO/WriteHelpers.h>
 #include <fcntl.h>
@@ -24,6 +25,10 @@
 #include <Interpreters/Context.h>
 #include <Core/Settings.h>
 #include <Processors/Executors/PullingPipelineExecutor.h>
+#include <Processors/Executors/CompletedPipelineExecutor.h>
+#include <Processors/ISink.h>
+#include <Processors/Port.h>
+#include <QueryPipeline/QueryPipeline.h>
 #include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypeArray.h>
 #include <DataTypes/DataTypeTuple.h>
@@ -45,6 +50,222 @@ namespace ErrorCodes
     extern const int BAD_ARGUMENTS;
     extern const int NOT_IMPLEMENTED;
 }
+
+/// Custom sink that writes Prometheus JSON format directly as data arrives
+class PrometheusJSONSink : public ISink
+{
+public:
+    enum class ResultType
+    {
+        INSTANT_VECTOR,
+        RANGE_VECTOR,
+        SCALAR
+    };
+
+    PrometheusJSONSink(SharedHeader header_, WriteBuffer & response_, ResultType result_type_, LoggerPtr log_)
+        : ISink(std::move(header_))
+        , response(response_)
+        , result_type(result_type_)
+        , log(log_)
+    {
+    }
+
+    String getName() const override { return "PrometheusJSONSink"; }
+
+protected:
+    void onStart() override
+    {
+        /// Write JSON header
+        if (result_type == ResultType::RANGE_VECTOR)
+            writeString(R"({"status":"success","data":{"resultType":"matrix","result":[)", response);
+        else
+            writeString(R"({"status":"success","data":{"resultType":"vector","result":[)", response);
+    }
+
+    void consume(Chunk chunk) override
+    {
+        auto block = getPort().getHeader().cloneWithColumns(chunk.detachColumns());
+        
+        if (block.rows() == 0)
+            return;
+
+        for (size_t i = 0; i < block.rows(); ++i)
+        {
+            if (first_result)
+                first_result = false;
+            else
+                writeString(",", response);
+
+            if (result_type == ResultType::RANGE_VECTOR)
+                writeRangeResult(block, i);
+            else if (result_type == ResultType::INSTANT_VECTOR)
+                writeInstantResult(block, i);
+            else
+                writeScalarResult(block, i);
+            
+            ++total_rows;
+        }
+    }
+
+    void onFinish() override
+    {
+        /// Write JSON footer
+        writeString("]}}", response);
+        LOG_DEBUG(log, "PrometheusJSONSink: wrote {} rows", total_rows);
+    }
+
+private:
+    void writeMetricLabels(const Block & block, size_t row_index)
+    {
+        writeString("{", response);
+
+        if (block.has(TimeSeriesColumnNames::Tags))
+        {
+            const auto & tags_column = block.getByName(TimeSeriesColumnNames::Tags).column;
+            if (const auto * array_column = typeid_cast<const ColumnArray *>(tags_column.get()))
+            {
+                const auto & offsets = array_column->getOffsets();
+                size_t start = (row_index == 0) ? 0 : offsets[row_index - 1];
+                size_t end = offsets[row_index];
+
+                if (const auto * tuple_column = typeid_cast<const ColumnTuple *>(&array_column->getData()))
+                {
+                    const auto & key_column = tuple_column->getColumn(0);
+                    const auto & value_column = tuple_column->getColumn(1);
+
+                    bool first = true;
+                    for (size_t j = start; j < end; ++j)
+                    {
+                        if (!first)
+                            writeString(",", response);
+                        first = false;
+
+                        writeJSONString(key_column.getDataAt(j), response, format_settings);
+                        writeString(":", response);
+                        writeJSONString(value_column.getDataAt(j), response, format_settings);
+                    }
+                }
+            }
+        }
+
+        writeString("}", response);
+    }
+
+    void writeInstantResult(const Block & block, size_t row_index)
+    {
+        writeString(R"({"metric":)", response);
+        writeMetricLabels(block, row_index);
+        writeString(R"(,"value":[)", response);
+
+        // Timestamp
+        if (block.has(TimeSeriesColumnNames::Timestamp))
+        {
+            const auto & ts_column = block.getByName(TimeSeriesColumnNames::Timestamp).column;
+            writeFloatText(ts_column->getFloat64(row_index), response);
+        }
+        else
+        {
+            writeFloatText(static_cast<double>(time(nullptr)), response);
+        }
+
+        writeString(",", response);
+
+        // Value as string
+        if (block.has(TimeSeriesColumnNames::Value))
+        {
+            const auto & value_column = block.getByName(TimeSeriesColumnNames::Value).column;
+            writeJSONString(fmt::format("{}", value_column->getFloat64(row_index)), response, format_settings);
+        }
+        else
+        {
+            writeJSONString("0", response, format_settings);
+        }
+
+        writeString("]}", response);
+    }
+
+    void writeRangeResult(const Block & block, size_t row_index)
+    {
+        writeString(R"({"metric":)", response);
+        writeMetricLabels(block, row_index);
+        writeString(R"(,"values":[)", response);
+
+        // For range queries, the TimeSeries column contains Array(Tuple(timestamp, value))
+        if (block.has(TimeSeriesColumnNames::TimeSeries))
+        {
+            const auto & ts_column = block.getByName(TimeSeriesColumnNames::TimeSeries).column;
+
+            if (const auto * array_column = typeid_cast<const ColumnArray *>(ts_column.get()))
+            {
+                const auto & offsets = array_column->getOffsets();
+                size_t start = (row_index == 0) ? 0 : offsets[row_index - 1];
+                size_t end = offsets[row_index];
+
+                if (const auto * tuple_column = typeid_cast<const ColumnTuple *>(&array_column->getData()))
+                {
+                    const auto & ts_data = tuple_column->getColumn(0);  // timestamps
+                    const auto & val_data = tuple_column->getColumn(1); // values
+
+                    for (size_t j = start; j < end; ++j)
+                    {
+                        if (j > start)
+                            writeString(",", response);
+                        writeString("[", response);
+                        writeFloatText(ts_data.getFloat64(j), response);
+                        writeString(",", response);
+                        writeJSONString(fmt::format("{}", val_data.getFloat64(j)), response, format_settings);
+                        writeString("]", response);
+                    }
+                }
+            }
+        }
+
+        writeString("]}", response);
+    }
+
+    void writeScalarResult(const Block & block, size_t row_index)
+    {
+        writeString("[", response);
+
+        // Timestamp
+        if (block.has(TimeSeriesColumnNames::Timestamp))
+        {
+            const auto & ts_column = block.getByName(TimeSeriesColumnNames::Timestamp).column;
+            writeFloatText(ts_column->getFloat64(row_index), response);
+        }
+        else
+        {
+            writeFloatText(static_cast<double>(time(nullptr)), response);
+        }
+
+        writeString(",", response);
+
+        // Value as string
+        if (block.has(TimeSeriesColumnNames::Scalar))
+        {
+            const auto & scalar_column = block.getByName(TimeSeriesColumnNames::Scalar).column;
+            writeJSONString(fmt::format("{}", scalar_column->getFloat64(row_index)), response, format_settings);
+        }
+        else if (block.has(TimeSeriesColumnNames::Value))
+        {
+            const auto & value_column = block.getByName(TimeSeriesColumnNames::Value).column;
+            writeJSONString(fmt::format("{}", value_column->getFloat64(row_index)), response, format_settings);
+        }
+        else
+        {
+            writeJSONString("0", response, format_settings);
+        }
+
+        writeString("]", response);
+    }
+
+    WriteBuffer & response;
+    ResultType result_type;
+    LoggerPtr log;
+    FormatSettings format_settings;
+    bool first_result = true;
+    size_t total_rows = 0;
+};
 
 PrometheusHTTPProtocolAPI::PrometheusHTTPProtocolAPI(ConstStoragePtr time_series_storage_, const ContextMutablePtr & context_)
     : WithMutableContext{context_}
@@ -180,80 +401,55 @@ void PrometheusHTTPProtocolAPI::executePromQLQuery(
 
     try
     {
-        /// Execute query (temporarily NOT internal for debugging/logging)
+        /// Execute query using streaming approach with CompletedPipelineExecutor
         auto [ast, io] = executeQuery(sql_string, query_context, QueryFlags{.internal = false}, QueryProcessingStage::Complete);
 
         UInt64 query_parse_compile_ms = watch.elapsedMilliseconds();
         watch.restart();
 
-        PullingPipelineExecutor executor(io.pipeline);
-        
-        UInt64 executor_create_ms = watch.elapsedMilliseconds();
-        watch.restart();
-        
-        /// First, pull ALL data from the pipeline (SQL execution)
-        std::vector<Block> all_blocks;
-        Block result_block;
-        size_t total_rows = 0;
-        size_t num_blocks = 0;
-        
-        UInt64 first_pull_ms = 0;
-        bool first_pull = true;
-        
-        while (executor.pull(result_block))
-        {
-            if (first_pull)
-            {
-                first_pull_ms = watch.elapsedMilliseconds();
-                first_pull = false;
-            }
-            total_rows += result_block.rows();
-            num_blocks++;
-            all_blocks.push_back(std::move(result_block));
-        }
-        
-        UInt64 data_fetch_ms = watch.elapsedMilliseconds();
-        watch.restart();
-
-        /// Now format the results to JSON (separate from SQL execution)
+        /// Determine the result type for the sink
+        PrometheusJSONSink::ResultType sink_result_type;
         if (converter.getResultType() == PrometheusQueryTree::ResultType::RANGE_VECTOR)
-        {
-            writeRangeQueryHeader(response);
-            for (const auto & block : all_blocks)
-                writeRangeQueryResponse(response, block);
-            writeRangeQueryFooter(response);
-        }
+            sink_result_type = PrometheusJSONSink::ResultType::RANGE_VECTOR;
         else if (converter.getResultType() == PrometheusQueryTree::ResultType::INSTANT_VECTOR)
-        {
-            writeInstantQueryHeader(response);
-            for (const auto & block : all_blocks)
-                writeInstantQueryResponse(response, block);
-            writeInstantQueryFooter(response);
-        }
+            sink_result_type = PrometheusJSONSink::ResultType::INSTANT_VECTOR;
         else if (converter.getResultType() == PrometheusQueryTree::ResultType::SCALAR)
-        {
-            writeInstantQueryHeader(response);
-            for (const auto & block : all_blocks)
-                writeScalarQueryResponse(response, block);
-            writeInstantQueryFooter(response);
-        }
+            sink_result_type = PrometheusJSONSink::ResultType::SCALAR;
         else
         {
             LOG_ERROR(log, "Unsupported result type: {}", converter.getResultType());
             writeString(R"({"status":"error","errorType":"internal","error":"Unsupported result type"})", response);
             return;
         }
-        
-        UInt64 json_format_time_ms = watch.elapsedMilliseconds();
+
+        /// Create a custom sink that writes Prometheus JSON format
+        auto prometheus_sink = std::make_shared<PrometheusJSONSink>(
+            io.pipeline.getSharedHeader(),
+            response,
+            sink_result_type,
+            log
+        );
+
+        /// Complete the pipeline with our sink
+        io.pipeline.complete(prometheus_sink);
+
+        UInt64 sink_setup_ms = watch.elapsedMilliseconds();
+        watch.restart();
+
+        /// Execute the completed pipeline - this runs the entire query and writes results
+        CompletedPipelineExecutor executor(io.pipeline);
+        executor.execute();
+
+        UInt64 execution_ms = watch.elapsedMilliseconds();
         UInt64 total_time_ms = total_watch.elapsedMilliseconds();
         
         // Write detailed timing to file for analysis
-        // Format: timestamp|query|total|promql|sql|ctx|compile|exec_create|first_pull|data_fetch|json|rows|blocks
+        // Format: timestamp|query|total|promql|sql|ctx|compile|sink_setup|execution|rows
         try
         {
             String timing_file = "/tmp/clickhouse_promql_timings.log";
             WriteBufferFromFile timing_buf(timing_file, DBMS_DEFAULT_BUFFER_SIZE, O_APPEND | O_CREAT | O_WRONLY);
-            writeString(fmt::format("{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}\n",
+            writeString(fmt::format("{}|{}|{}|{}|{}|{}|{}|{}|{}|streaming\n",
                 time(nullptr),
                 params.promql_query,
                 total_time_ms,
@@ -261,12 +457,8 @@ void PrometheusHTTPProtocolAPI::executePromQLQuery(
                 conversion_time_ms,
                 context_setup_ms,
                 query_parse_compile_ms,
-                executor_create_ms,
-                first_pull_ms,
-                data_fetch_ms,
-                json_format_time_ms,
-                total_rows,
-                num_blocks), timing_buf);
+                sink_setup_ms,
+                execution_ms), timing_buf);
             timing_buf.finalize();
         }
         catch (...)
@@ -274,8 +466,8 @@ void PrometheusHTTPProtocolAPI::executePromQLQuery(
             // Ignore timing file errors
         }
         
-        LOG_INFO(log, "PromQL '{}' {}ms (promql: {}ms, sql: {}ms, ctx: {}ms, compile: {}ms, exec_create: {}ms, first_pull: {}ms, fetch: {}ms, json: {}ms, rows: {}, blocks: {})", 
-                 params.promql_query, total_time_ms, parse_time_ms, conversion_time_ms, context_setup_ms, query_parse_compile_ms, executor_create_ms, first_pull_ms, data_fetch_ms, json_format_time_ms, total_rows, num_blocks);
+        LOG_INFO(log, "PromQL '{}' {}ms STREAMING (promql: {}ms, sql: {}ms, ctx: {}ms, compile: {}ms, sink_setup: {}ms, execution: {}ms)", 
+                 params.promql_query, total_time_ms, parse_time_ms, conversion_time_ms, context_setup_ms, query_parse_compile_ms, sink_setup_ms, execution_ms);
         return;
     }
     catch (const Exception & e)

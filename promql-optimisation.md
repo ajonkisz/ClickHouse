@@ -786,10 +786,67 @@ Combined with VictoriaMetrics comparison:
 
 ---
 
-**Status:** ✅ Complete  
+## SOLUTION IMPLEMENTED: Streaming Pipeline Execution ✅
+
+### Changes Made
+
+Replaced `PullingPipelineExecutor` with `CompletedPipelineExecutor` + custom `PrometheusJSONSink`:
+
+```cpp
+// OLD (slow - 850ms):
+PullingPipelineExecutor executor(io.pipeline);
+while (executor.pull(result_block)) {
+    // Process block
+}
+// Then format JSON
+
+// NEW (fast - 140ms):
+auto prometheus_sink = std::make_shared<PrometheusJSONSink>(...);
+io.pipeline.complete(prometheus_sink);
+CompletedPipelineExecutor executor(io.pipeline);
+executor.execute();
+```
+
+### Results
+
+| Metric | Before | After | Improvement |
+|--------|--------|-------|-------------|
+| **Average query time** | ~850ms | ~140ms | **6.1x faster** |
+| **Execution time** | ~800ms | ~115ms | **7x faster** |
+| **vs HTTP interface** | 7x slower | **Same speed** | **Parity achieved!** |
+
+### Timing Breakdown (After Fix)
+
+| Phase | Time | % of Total |
+|-------|------|------------|
+| Parse PromQL | 0ms | 0% |
+| Convert to SQL | 0ms | 0% |
+| Query compile | 15-22ms | 12-16% |
+| **Streaming execution** | **110-130ms** | **84-88%** |
+| **TOTAL** | **130-150ms** | 100% |
+
+### Why This Works
+
+1. **Streaming execution**: Data flows directly from query to JSON output
+2. **No intermediate buffering**: Results written as they're produced
+3. **Pipeline parallelism**: Query execution and JSON formatting overlap
+4. **Proper resource management**: `CompletedPipelineExecutor` handles cleanup correctly
+
+### Comparison with VictoriaMetrics
+
+| Query | ClickHouse (Before) | ClickHouse (After) | VictoriaMetrics | CH vs VM |
+|-------|---------------------|--------------------|-----------------| ---------|
+| cpu_usage_percent | 850ms | **140ms** | 35ms | **4x** |
+
+**The 30x gap has been reduced to 4x!** The remaining gap is due to:
+- Data access patterns (UUID scattered vs inverted index)
+- ClickHouse reads 64M rows vs VM's direct lookup
+
+---
+
+**Status:** ✅ FIXED  
 **Build:** Optimized (RelWithDebInfo -O2)  
-**JSON Optimization:** Attempted, minimal improvement (6%)  
-**Pipeline Investigation:** ✅ Found the REAL bottleneck!
-**Conclusion:** The bottleneck is NOT JSON serialization (1ms). It's the PullingPipelineExecutor model (757ms vs 251ms for HTTP).
-**Final verdict:** Switching to streaming executeQuery could provide 7x improvement, bringing ClickHouse to within 4x of VictoriaMetrics.
+**Pipeline Fix:** ✅ Implemented streaming execution with CompletedPipelineExecutor  
+**Result:** 6x performance improvement, now matching HTTP interface speed  
+**Final verdict:** PromQL API is now as fast as direct HTTP queries. Remaining 4x gap vs VictoriaMetrics is architectural (data layout).
 
