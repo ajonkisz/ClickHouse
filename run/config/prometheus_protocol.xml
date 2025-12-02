@@ -22,7 +22,7 @@
         <handler>
           <type>remote_write</type>
           <database>otel</database>
-          <table>metrics_v4</table>
+          <table>metrics_v6</table>
         </handler>
       </write>
       
@@ -32,7 +32,7 @@
         <handler>
           <type>remote_read</type>
           <database>otel</database>
-          <table>metrics_v4</table>
+          <table>metrics_v6</table>
         </handler>
       </read>
       
@@ -41,8 +41,8 @@
         <url>/api/v1/query_range</url>
         <handler>
           <type>query_api</type>
-          <database>otel</database>
-          <table>metrics_v4</table>
+          <database>test_promql</database>
+          <table>test_metrics</table>
           <lookback_delta>300</lookback_delta>
         </handler>
       </query_range>
@@ -52,8 +52,8 @@
         <url>/api/v1/query</url>
         <handler>
           <type>query_api</type>
-          <database>otel</database>
-          <table>metrics_v4</table>
+          <database>test_promql</database>
+          <table>test_metrics</table>
         </handler>
       </query>
 
@@ -62,8 +62,8 @@
         <url>/api/v1/series</url>
         <handler>
           <type>query_api</type>
-          <database>otel</database>
-          <table>metrics_v4</table>
+          <database>test_promql</database>
+          <table>test_metrics</table>
         </handler>
       </series>
 
@@ -72,8 +72,8 @@
         <url>/api/v1/labels</url>
         <handler>
           <type>query_api</type>
-          <database>otel</database>
-          <table>metrics_v4</table>
+          <database>test_promql</database>
+          <table>test_metrics</table>
         </handler>
       </labels>
 
@@ -83,8 +83,8 @@
         <url>regex:/api/v1/label/[^/]+/values</url>
         <handler>
           <type>query_api</type>
-          <database>otel</database>
-          <table>metrics_v4</table>
+          <database>test_promql</database>
+          <table>test_metrics</table>
         </handler>
       </label_values>
     </handlers>

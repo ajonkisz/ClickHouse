@@ -22,7 +22,7 @@
         <handler>
           <type>remote_write</type>
           <database>otel</database>
-          <table>metrics_v4</table>
+          <table>metrics_v6</table>
         </handler>
       </write>
       
@@ -32,7 +32,7 @@
         <handler>
           <type>remote_read</type>
           <database>otel</database>
-          <table>metrics_v4</table>
+          <table>metrics_v6</table>
         </handler>
       </read>
       
@@ -42,7 +42,7 @@
         <handler>
           <type>query_api</type>
           <database>otel</database>
-          <table>metrics_v4</table>
+          <table>metrics_v6</table>
           <lookback_delta>300</lookback_delta>
         </handler>
       </query_range>
@@ -53,7 +53,7 @@
         <handler>
           <type>query_api</type>
           <database>otel</database>
-          <table>metrics_v4</table>
+          <table>metrics_v6</table>
         </handler>
       </query>
 
@@ -63,7 +63,7 @@
         <handler>
           <type>query_api</type>
           <database>otel</database>
-          <table>metrics_v4</table>
+          <table>metrics_v6</table>
         </handler>
       </series>
 
@@ -73,7 +73,7 @@
         <handler>
           <type>query_api</type>
           <database>otel</database>
-          <table>metrics_v4</table>
+          <table>metrics_v6</table>
         </handler>
       </labels>
 
@@ -84,7 +84,7 @@
         <handler>
           <type>query_api</type>
           <database>otel</database>
-          <table>metrics_v4</table>
+          <table>metrics_v6</table>
         </handler>
       </label_values>
     </handlers>
