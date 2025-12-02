@@ -1,0 +1,8 @@
+<clickhouse>
+    <logger>
+        <log replace="replace">/Users/aj/Development/ClickHouse/run/logs/clickhouse-server.log</log>
+        <errorlog replace="replace">/Users/aj/Development/ClickHouse/run/logs/clickhouse-server.err.log</errorlog>
+        <level>debug</level>
+    </logger>
+</clickhouse>
+

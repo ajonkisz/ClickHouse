@@ -666,9 +666,130 @@ The 23x gap cannot be closed with JSON serialization optimizations alone. It req
 
 ---
 
+## Critical Finding: Pipeline Execution Bottleneck (2025-12-02)
+
+### Discovery
+
+**Detailed timing instrumentation revealed the REAL bottleneck:**
+
+| Phase | Time | % of Total |
+|-------|------|------------|
+| Parse PromQL | 0ms | 0.0% |
+| Convert to SQL | 0ms | 0.0% |
+| Context setup | 0ms | 0.0% |
+| Query compile | 20ms | 2.4% |
+| **Data fetch (first_pull)** | **814ms** | **97.3%** |
+| JSON format | 1ms | 0.1% |
+| **TOTAL** | **836ms** | 100% |
+
+**JSON serialization is NOT the bottleneck!** It only takes **1ms** (0.1% of total time).
+
+### The Real Issue: Pipeline Execution Model
+
+**Same query, different execution paths:**
+
+| Method | Time | Rows Read | Notes |
+|--------|------|-----------|-------|
+| **HTTP Interface** | 145ms | 64M | Uses streaming `executeQuery(ReadBuffer, WriteBuffer)` |
+| **PromQL API** | 1063ms | 64M | Uses `PullingPipelineExecutor` |
+
+**The PromQL API is 7.3x slower than HTTP for the SAME SQL query!**
+
+### Why?
+
+The HTTP interface uses a **streaming execution model**:
+```cpp
+executeQuery(ReadBuffer & in, WriteBuffer & out, ...)
+```
+- Results are pushed directly to output as they're produced
+- No intermediate buffering
+- Pipeline executes in parallel with output
+
+The PromQL API uses a **pull model**:
+```cpp
+auto [ast, io] = executeQuery(sql_string, context, ...);
+PullingPipelineExecutor executor(io.pipeline);
+while (executor.pull(result_block)) { ... }
+```
+- Pull blocks one by one
+- Sequential execution: pull → process → pull → process
+- No parallelism between pulling and processing
+
+### Evidence from Logs
+
+**HTTP Interface (query 155fb860):**
+```
+13:54:54.597554 - executeQuery started
+13:54:54.614159 - Reading approx. 63963136 rows with 10 streams
+13:54:54.848847 - Read 63971328 rows in 0.251485 sec (254M rows/sec)
+```
+**Total: 251ms**
+
+**PromQL API (query 2bd128d2):**
+```
+13:54:54.858592 - PromQL converted to SQL
+13:54:54.858862 - executeQuery started
+13:54:54.873536 - Reading approx. 63963136 rows with 10 streams
+13:54:55.634086 - PromQL completed: first_pull: 757ms
+```
+**Total: 775ms**
+
+Both read **64 million rows**, but:
+- HTTP: **251ms** (254M rows/sec)
+- PromQL: **757ms** (85M rows/sec)
+
+**3x throughput difference for identical data!**
+
+### Root Cause
+
+The `PullingPipelineExecutor` has overhead that doesn't exist in the streaming model:
+1. **Context switching** between pull calls
+2. **No pipelining** - blocks wait for processing before next pull
+3. **Memory management** overhead for block allocation/deallocation
+4. **QueryFinish logging** not triggered (pipeline not properly finalized)
+
+### Solution Options
+
+**Option 1: Use streaming `executeQuery` (Recommended)**
+```cpp
+// Instead of:
+auto [ast, io] = executeQuery(sql_string, context, ...);
+PullingPipelineExecutor executor(io.pipeline);
+while (executor.pull(block)) { ... }
+
+// Use:
+executeQuery(ReadBufferFromString(sql_string), response_buffer, context, ...);
+```
+This would require custom output format for Prometheus JSON.
+
+**Option 2: Optimize PullingPipelineExecutor usage**
+- Pre-allocate blocks
+- Reduce context switching
+- Use larger block sizes
+
+**Option 3: Investigate why QueryFinish isn't logged**
+- The query log shows `QueryStart` but no `QueryFinish`
+- This suggests improper pipeline finalization
+- May indicate resource leaks or missed optimizations
+
+### Expected Improvement
+
+If we can match HTTP interface performance:
+- Current: 1063ms (PromQL API)
+- Target: 145ms (HTTP interface equivalent)
+- **Improvement: 7.3x**
+
+Combined with VictoriaMetrics comparison:
+- ClickHouse HTTP: 145ms
+- VictoriaMetrics: 35ms
+- Remaining gap: 4x (due to data access patterns, not execution)
+
+---
+
 **Status:** ✅ Complete  
 **Build:** Optimized (RelWithDebInfo -O2)  
 **JSON Optimization:** Attempted, minimal improvement (6%)  
-**Conclusion:** Performance gap is architectural, not serialization optimization  
-**Final verdict:** Debug build was an issue (19% slowness). JSON optimization helped 6%. The remaining 23x gap is inherent to the architecture.
+**Pipeline Investigation:** ✅ Found the REAL bottleneck!
+**Conclusion:** The bottleneck is NOT JSON serialization (1ms). It's the PullingPipelineExecutor model (757ms vs 251ms for HTTP).
+**Final verdict:** Switching to streaming executeQuery could provide 7x improvement, bringing ClickHouse to within 4x of VictoriaMetrics.
 

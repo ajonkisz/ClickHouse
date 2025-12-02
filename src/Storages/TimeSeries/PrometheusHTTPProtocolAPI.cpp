@@ -72,7 +72,7 @@ void PrometheusHTTPProtocolAPI::executePromQLQuery(
     auto query_tree = std::make_unique<PrometheusQueryTree>();
     try
     {
-        query_tree->parse(params.promql_query);
+    query_tree->parse(params.promql_query);
     }
     catch (const Exception & e)
     {
@@ -108,18 +108,18 @@ void PrometheusHTTPProtocolAPI::executePromQLQuery(
 
     try
     {
-        if (params.type == Type::Instant)
-        {
-            evaluation_time = parseTimestamp(params.time_param);
-            lookback_delta = Field(300.0);
-            step = Field(15.0);
-        }
-        else if (params.type == Type::Range)
-        {
-            start_time = parseTimestamp(params.start_param);
-            end_time = parseTimestamp(params.end_param);
-            step = parseStep(params.step_param);
-            lookback_delta = Field(end_time.safeGet<Float64>() - start_time.safeGet<Float64>());
+    if (params.type == Type::Instant)
+    {
+        evaluation_time = parseTimestamp(params.time_param);
+        lookback_delta = Field(300.0);
+        step = Field(15.0);
+    }
+    else if (params.type == Type::Range)
+    {
+        start_time = parseTimestamp(params.start_param);
+        end_time = parseTimestamp(params.end_param);
+        step = parseStep(params.step_param);
+        lookback_delta = Field(end_time.safeGet<Float64>() - start_time.safeGet<Float64>());
         }
     }
     catch (const Exception & e)
@@ -167,56 +167,74 @@ void PrometheusHTTPProtocolAPI::executePromQLQuery(
     watch.restart();
     
     String sql_string = sql_query->formatWithSecretsOneLine();
-    LOG_DEBUG(log, "Converted PromQL to SQL in {}ms. SQL: {}", conversion_time_ms, sql_string);
+    LOG_WARNING(log, "PromQL '{}' -> SQL ({}ms): {}", params.promql_query, conversion_time_ms, sql_string);
 
     /// Create a copy of the context for query execution to avoid modifying the original
     auto query_context = Context::createCopy(getContext());
     query_context->makeQueryContext();
     query_context->setCurrentQueryId(toString(thread_local_rng()));
     query_context->setSetting("allow_experimental_time_series_aggregate_functions", Field(1));
+    
+    UInt64 context_setup_ms = watch.elapsedMilliseconds();
+    watch.restart();
 
     try
     {
-        /// Execute as internal query to prevent assertions in some edge cases
-        auto [ast, io] = executeQuery(sql_string, query_context, QueryFlags{.internal = true}, QueryProcessingStage::Complete);
+        /// Execute query (temporarily NOT internal for debugging/logging)
+        auto [ast, io] = executeQuery(sql_string, query_context, QueryFlags{.internal = false}, QueryProcessingStage::Complete);
 
-        UInt64 prepare_time_ms = watch.elapsedMilliseconds();
+        UInt64 query_parse_compile_ms = watch.elapsedMilliseconds();
         watch.restart();
 
         PullingPipelineExecutor executor(io.pipeline);
+        
+        UInt64 executor_create_ms = watch.elapsedMilliseconds();
+        watch.restart();
+        
+        /// First, pull ALL data from the pipeline (SQL execution)
+        std::vector<Block> all_blocks;
         Block result_block;
-
         size_t total_rows = 0;
+        size_t num_blocks = 0;
+        
+        UInt64 first_pull_ms = 0;
+        bool first_pull = true;
+        
+        while (executor.pull(result_block))
+        {
+            if (first_pull)
+            {
+                first_pull_ms = watch.elapsedMilliseconds();
+                first_pull = false;
+            }
+            total_rows += result_block.rows();
+            num_blocks++;
+            all_blocks.push_back(std::move(result_block));
+        }
+        
+        UInt64 data_fetch_ms = watch.elapsedMilliseconds();
+        watch.restart();
 
-        /// Mind using the getResultType() method from PrometheusQueryToSQLConverter, not from the PrometheusQueryTree.
+        /// Now format the results to JSON (separate from SQL execution)
         if (converter.getResultType() == PrometheusQueryTree::ResultType::RANGE_VECTOR)
         {
             writeRangeQueryHeader(response);
-            while (executor.pull(result_block))
-            {
-                total_rows += result_block.rows();
-                writeRangeQueryResponse(response, result_block);
-            }
+            for (const auto & block : all_blocks)
+                writeRangeQueryResponse(response, block);
             writeRangeQueryFooter(response);
         }
         else if (converter.getResultType() == PrometheusQueryTree::ResultType::INSTANT_VECTOR)
         {
             writeInstantQueryHeader(response);
-            while (executor.pull(result_block))
-            {
-                total_rows += result_block.rows();
-                writeInstantQueryResponse(response, result_block);
-            }
+            for (const auto & block : all_blocks)
+                writeInstantQueryResponse(response, block);
             writeInstantQueryFooter(response);
         }
         else if (converter.getResultType() == PrometheusQueryTree::ResultType::SCALAR)
         {
             writeInstantQueryHeader(response);
-            while (executor.pull(result_block))
-            {
-                total_rows += result_block.rows();
-                writeScalarQueryResponse(response, result_block);
-            }
+            for (const auto & block : all_blocks)
+                writeScalarQueryResponse(response, block);
             writeInstantQueryFooter(response);
         }
         else
@@ -226,23 +244,29 @@ void PrometheusHTTPProtocolAPI::executePromQLQuery(
             return;
         }
         
-        UInt64 execution_and_format_time_ms = watch.elapsedMilliseconds();
+        UInt64 json_format_time_ms = watch.elapsedMilliseconds();
         UInt64 total_time_ms = total_watch.elapsedMilliseconds();
         
-        // Write timing details to file for analysis
+        // Write detailed timing to file for analysis
+        // Format: timestamp|query|total|promql|sql|ctx|compile|exec_create|first_pull|data_fetch|json|rows|blocks
         try
         {
             String timing_file = "/tmp/clickhouse_promql_timings.log";
             WriteBufferFromFile timing_buf(timing_file, DBMS_DEFAULT_BUFFER_SIZE, O_APPEND | O_CREAT | O_WRONLY);
-            writeString(fmt::format("{}|{}|{}|{}|{}|{}|{}|{}\n",
+            writeString(fmt::format("{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}\n",
                 time(nullptr),
                 params.promql_query,
                 total_time_ms,
                 parse_time_ms,
                 conversion_time_ms,
-                prepare_time_ms,
-                execution_and_format_time_ms,
-                total_rows), timing_buf);
+                context_setup_ms,
+                query_parse_compile_ms,
+                executor_create_ms,
+                first_pull_ms,
+                data_fetch_ms,
+                json_format_time_ms,
+                total_rows,
+                num_blocks), timing_buf);
             timing_buf.finalize();
         }
         catch (...)
@@ -250,8 +274,8 @@ void PrometheusHTTPProtocolAPI::executePromQLQuery(
             // Ignore timing file errors
         }
         
-        LOG_INFO(log, "PromQL query '{}' completed in {}ms (parse: {}ms, convert: {}ms, prepare: {}ms, exec+format: {}ms, rows: {})", 
-                 params.promql_query, total_time_ms, parse_time_ms, conversion_time_ms, prepare_time_ms, execution_and_format_time_ms, total_rows);
+        LOG_INFO(log, "PromQL '{}' {}ms (promql: {}ms, sql: {}ms, ctx: {}ms, compile: {}ms, exec_create: {}ms, first_pull: {}ms, fetch: {}ms, json: {}ms, rows: {}, blocks: {})", 
+                 params.promql_query, total_time_ms, parse_time_ms, conversion_time_ms, context_setup_ms, query_parse_compile_ms, executor_create_ms, first_pull_ms, data_fetch_ms, json_format_time_ms, total_rows, num_blocks);
         return;
     }
     catch (const Exception & e)
@@ -271,9 +295,9 @@ void PrometheusHTTPProtocolAPI::getSeries(
     const String & end_param)
 {
     try
-    {
-        /// Build SQL query to get all series matching the selector
-        /// SELECT DISTINCT tags FROM <tags_table> WHERE <match conditions> [AND timestamp BETWEEN start AND end]
+{
+    /// Build SQL query to get all series matching the selector
+    /// SELECT DISTINCT tags FROM <tags_table> WHERE <match conditions> [AND timestamp BETWEEN start AND end]
 
         /// Get the actual tags table ID from the TimeSeries storage
         auto tags_table_id = time_series_storage->getTargetTableId(ViewTarget::Tags);
@@ -282,121 +306,121 @@ void PrometheusHTTPProtocolAPI::getSeries(
         /// Note: 'all_tags' is EPHEMERAL (not stored), so we use 'tags' combined with 'metric_name'
         String sql = fmt::format("SELECT DISTINCT metric_name, tags FROM {} ", tags_table);
 
-        std::vector<String> conditions;
+    std::vector<String> conditions;
 
-        /// Parse match[] parameter if provided
-        if (!match_param.empty())
+    /// Parse match[] parameter if provided
+    if (!match_param.empty())
+    {
+        /// For now, assume match_param is a metric name or simple label matcher
+        /// A full implementation would parse PromQL label matchers
+        if (match_param.find('{') == String::npos)
         {
-            /// For now, assume match_param is a metric name or simple label matcher
-            /// A full implementation would parse PromQL label matchers
-            if (match_param.find('{') == String::npos)
-            {
-                /// Simple metric name
-                conditions.push_back(fmt::format("metric_name = '{}'", match_param));
-            }
-            /// TODO: Parse complex label matchers like {job="prometheus"}
+            /// Simple metric name
+            conditions.push_back(fmt::format("metric_name = '{}'", match_param));
         }
+        /// TODO: Parse complex label matchers like {job="prometheus"}
+    }
 
-        /// Add time range conditions if provided
-        if (!start_param.empty())
+    /// Add time range conditions if provided
+    if (!start_param.empty())
+    {
+        auto start_ts = parseTimestamp(start_param);
+        conditions.push_back(fmt::format("min_time >= {}", start_ts.safeGet<Float64>()));
+    }
+    if (!end_param.empty())
+    {
+        auto end_ts = parseTimestamp(end_param);
+        conditions.push_back(fmt::format("max_time <= {}", end_ts.safeGet<Float64>()));
+    }
+
+    if (!conditions.empty())
+    {
+        sql += " WHERE ";
+        for (size_t i = 0; i < conditions.size(); ++i)
         {
-            auto start_ts = parseTimestamp(start_param);
-            conditions.push_back(fmt::format("min_time >= {}", start_ts.safeGet<Float64>()));
+            if (i > 0)
+                sql += " AND ";
+            sql += conditions[i];
         }
-        if (!end_param.empty())
-        {
-            auto end_ts = parseTimestamp(end_param);
-            conditions.push_back(fmt::format("max_time <= {}", end_ts.safeGet<Float64>()));
-        }
+    }
 
-        if (!conditions.empty())
-        {
-            sql += " WHERE ";
-            for (size_t i = 0; i < conditions.size(); ++i)
-            {
-                if (i > 0)
-                    sql += " AND ";
-                sql += conditions[i];
-            }
-        }
+    sql += " LIMIT 10000";
 
-        sql += " LIMIT 10000";
-
-        LOG_DEBUG(log, "Series query SQL: {}", sql);
+    LOG_DEBUG(log, "Series query SQL: {}", sql);
 
         /// Create a copy of the context for query execution to avoid modifying the original
         auto query_context = Context::createCopy(getContext());
-        query_context->makeQueryContext();
-        query_context->setCurrentQueryId(toString(thread_local_rng()));
+    query_context->makeQueryContext();
+    query_context->setCurrentQueryId(toString(thread_local_rng()));
 
         /// Execute as internal query to prevent assertions in some edge cases
         auto [ast, io] = executeQuery(sql, query_context, QueryFlags{.internal = true}, QueryProcessingStage::Complete);
 
-        PullingPipelineExecutor executor(io.pipeline);
-        Block result_block;
+    PullingPipelineExecutor executor(io.pipeline);
+    Block result_block;
 
-        writeString(R"({"status":"success","data":[)", response);
-        bool first_series = true;
+    writeString(R"({"status":"success","data":[)", response);
+    bool first_series = true;
 
-        while (executor.pull(result_block))
+    while (executor.pull(result_block))
+    {
+        if (result_block.empty() || result_block.rows() == 0)
+            continue;
+
+        /// Column 0 is metric_name, column 1 is tags (Map)
+        const auto & metric_name_column = result_block.getByPosition(0).column;
+        const auto & tags_column = result_block.getByPosition(1).column;
+
+        for (size_t row = 0; row < result_block.rows(); ++row)
         {
-            if (result_block.empty() || result_block.rows() == 0)
-                continue;
+            if (!first_series)
+                writeString(",", response);
+            first_series = false;
 
-            /// Column 0 is metric_name, column 1 is tags (Map)
-            const auto & metric_name_column = result_block.getByPosition(0).column;
-            const auto & tags_column = result_block.getByPosition(1).column;
+            /// Write the series as a JSON object of labels
+            writeString("{", response);
 
-            for (size_t row = 0; row < result_block.rows(); ++row)
+            /// First add __name__ from metric_name
+            Field metric_name_field;
+            metric_name_column->get(row, metric_name_field);
+            String metric_name;
+            if (metric_name_field.tryGet<String>(metric_name))
             {
-                if (!first_series)
-                    writeString(",", response);
-                first_series = false;
+                writeString(R"("__name__":")", response);
+                writeString(metric_name, response);
+                writeString("\"", response);
+            }
 
-                /// Write the series as a JSON object of labels
-                writeString("{", response);
-
-                /// First add __name__ from metric_name
-                Field metric_name_field;
-                metric_name_column->get(row, metric_name_field);
-                String metric_name;
-                if (metric_name_field.tryGet<String>(metric_name))
+            /// Then add other labels from tags map
+            Field tags_field;
+            tags_column->get(row, tags_field);
+            if (tags_field.getType() == Field::Types::Map)
+            {
+                const auto & tags_map = tags_field.safeGet<Map>();
+                for (const auto & map_element : tags_map)
                 {
-                    writeString(R"("__name__":")", response);
-                    writeString(metric_name, response);
+                    const auto & map_entry = map_element.safeGet<Tuple>();
+                    if (map_entry.size() != 2)
+                        continue;
+
+                    String key;
+                    String value;
+                    if (!map_entry[0].tryGet<String>(key) || !map_entry[1].tryGet<String>(value))
+                        continue;
+
+                    writeString(",\"", response);
+                    writeString(key, response);
+                    writeString("\":\"", response);
+                    writeString(value, response);
                     writeString("\"", response);
                 }
-
-                /// Then add other labels from tags map
-                Field tags_field;
-                tags_column->get(row, tags_field);
-                if (tags_field.getType() == Field::Types::Map)
-                {
-                    const auto & tags_map = tags_field.safeGet<Map>();
-                    for (const auto & map_element : tags_map)
-                    {
-                        const auto & map_entry = map_element.safeGet<Tuple>();
-                        if (map_entry.size() != 2)
-                            continue;
-
-                        String key;
-                        String value;
-                        if (!map_entry[0].tryGet<String>(key) || !map_entry[1].tryGet<String>(value))
-                            continue;
-
-                        writeString(",\"", response);
-                        writeString(key, response);
-                        writeString("\":\"", response);
-                        writeString(value, response);
-                        writeString("\"", response);
-                    }
-                }
-
-                writeString("}", response);
             }
-        }
 
-        writeString("]}", response);
+            writeString("}", response);
+        }
+    }
+
+    writeString("]}", response);
     }
     catch (const Exception & e)
     {
@@ -414,99 +438,99 @@ void PrometheusHTTPProtocolAPI::getLabels(
     const String & end_param)
 {
     try
-    {
-        /// Build SQL query to get all distinct label names
-        /// We need to extract keys from the all_tags Map column
+{
+    /// Build SQL query to get all distinct label names
+    /// We need to extract keys from the all_tags Map column
         /// Get the actual tags table ID from the TimeSeries storage
         auto tags_table_id = time_series_storage->getTargetTableId(ViewTarget::Tags);
         String tags_table = backQuoteIfNeed(tags_table_id.database_name) + "." + backQuoteIfNeed(tags_table_id.table_name);
 
         /// Use arrayJoin(mapKeys(tags)) to get unique label names
         /// Note: 'all_tags' is EPHEMERAL (not stored), so we use 'tags'
-        String sql = fmt::format(
+    String sql = fmt::format(
             "SELECT DISTINCT arrayJoin(mapKeys(tags)) as label_name FROM {} ",
-            tags_table);
+        tags_table);
 
-        std::vector<String> conditions;
+    std::vector<String> conditions;
 
-        if (!match_param.empty())
+    if (!match_param.empty())
+    {
+        if (match_param.find('{') == String::npos)
         {
-            if (match_param.find('{') == String::npos)
-            {
-                conditions.push_back(fmt::format("metric_name = '{}'", match_param));
-            }
+            conditions.push_back(fmt::format("metric_name = '{}'", match_param));
         }
+    }
 
-        if (!start_param.empty())
+    if (!start_param.empty())
+    {
+        auto start_ts = parseTimestamp(start_param);
+        conditions.push_back(fmt::format("min_time >= {}", start_ts.safeGet<Float64>()));
+    }
+    if (!end_param.empty())
+    {
+        auto end_ts = parseTimestamp(end_param);
+        conditions.push_back(fmt::format("max_time <= {}", end_ts.safeGet<Float64>()));
+    }
+
+    if (!conditions.empty())
+    {
+        sql += " WHERE ";
+        for (size_t i = 0; i < conditions.size(); ++i)
         {
-            auto start_ts = parseTimestamp(start_param);
-            conditions.push_back(fmt::format("min_time >= {}", start_ts.safeGet<Float64>()));
+            if (i > 0)
+                sql += " AND ";
+            sql += conditions[i];
         }
-        if (!end_param.empty())
-        {
-            auto end_ts = parseTimestamp(end_param);
-            conditions.push_back(fmt::format("max_time <= {}", end_ts.safeGet<Float64>()));
-        }
+    }
 
-        if (!conditions.empty())
-        {
-            sql += " WHERE ";
-            for (size_t i = 0; i < conditions.size(); ++i)
-            {
-                if (i > 0)
-                    sql += " AND ";
-                sql += conditions[i];
-            }
-        }
+    sql += " ORDER BY label_name LIMIT 10000";
 
-        sql += " ORDER BY label_name LIMIT 10000";
-
-        LOG_DEBUG(log, "Labels query SQL: {}", sql);
+    LOG_DEBUG(log, "Labels query SQL: {}", sql);
 
         /// Create a copy of the context for query execution to avoid modifying the original
         auto query_context = Context::createCopy(getContext());
-        query_context->makeQueryContext();
-        query_context->setCurrentQueryId(toString(thread_local_rng()));
+    query_context->makeQueryContext();
+    query_context->setCurrentQueryId(toString(thread_local_rng()));
 
         /// Execute as internal query to prevent assertions in some edge cases
         auto [ast, io] = executeQuery(sql, query_context, QueryFlags{.internal = true}, QueryProcessingStage::Complete);
 
-        PullingPipelineExecutor executor(io.pipeline);
-        Block result_block;
+    PullingPipelineExecutor executor(io.pipeline);
+    Block result_block;
 
-        /// Collect all labels first to avoid duplicates
-        std::set<String> all_labels;
-        all_labels.insert("__name__");  /// Always include __name__
+    /// Collect all labels first to avoid duplicates
+    std::set<String> all_labels;
+    all_labels.insert("__name__");  /// Always include __name__
 
-        while (executor.pull(result_block))
+    while (executor.pull(result_block))
+    {
+        if (result_block.empty() || result_block.rows() == 0)
+            continue;
+
+        const auto & label_column = result_block.getByPosition(0).column;
+        for (size_t row = 0; row < result_block.rows(); ++row)
         {
-            if (result_block.empty() || result_block.rows() == 0)
-                continue;
-
-            const auto & label_column = result_block.getByPosition(0).column;
-            for (size_t row = 0; row < result_block.rows(); ++row)
-            {
-                Field field;
-                label_column->get(row, field);
-                String label_name;
-                if (field.tryGet<String>(label_name) && !label_name.empty())
-                    all_labels.insert(label_name);
-            }
+            Field field;
+            label_column->get(row, field);
+            String label_name;
+            if (field.tryGet<String>(label_name) && !label_name.empty())
+                all_labels.insert(label_name);
         }
+    }
 
-        writeString(R"({"status":"success","data":[)", response);
-        bool first = true;
-        for (const auto & label : all_labels)
-        {
-            if (!first)
-                writeString(",", response);
-            first = false;
+    writeString(R"({"status":"success","data":[)", response);
+    bool first = true;
+    for (const auto & label : all_labels)
+    {
+        if (!first)
+            writeString(",", response);
+        first = false;
 
-            writeString("\"", response);
-            writeString(label, response);
-            writeString("\"", response);
-        }
-        writeString("]}", response);
+        writeString("\"", response);
+        writeString(label, response);
+        writeString("\"", response);
+    }
+    writeString("]}", response);
     }
     catch (const Exception & e)
     {
@@ -530,109 +554,109 @@ void PrometheusHTTPProtocolAPI::getLabelValues(
         auto tags_table_id = time_series_storage->getTargetTableId(ViewTarget::Tags);
         String tags_table = backQuoteIfNeed(tags_table_id.database_name) + "." + backQuoteIfNeed(tags_table_id.table_name);
 
-        String sql;
+    String sql;
 
-        /// Special handling for __name__ label
-        if (label_name == "__name__")
-        {
-            sql = fmt::format("SELECT DISTINCT metric_name FROM {} ", tags_table);
-        }
-        else
-        {
+    /// Special handling for __name__ label
+    if (label_name == "__name__")
+    {
+        sql = fmt::format("SELECT DISTINCT metric_name FROM {} ", tags_table);
+    }
+    else
+    {
         /// Get distinct values for the specified label from the tags Map
         /// Note: 'all_tags' is EPHEMERAL (not stored), so we use 'tags'
         sql = fmt::format(
             "SELECT DISTINCT tags['{}'] as label_value FROM {} WHERE mapContains(tags, '{}') ",
             label_name, tags_table, label_name);
-        }
+    }
 
-        std::vector<String> conditions;
+    std::vector<String> conditions;
 
-        if (!match_param.empty())
+    if (!match_param.empty())
+    {
+        if (match_param.find('{') == String::npos)
         {
-            if (match_param.find('{') == String::npos)
+            conditions.push_back(fmt::format("metric_name = '{}'", match_param));
+        }
+    }
+
+    if (!start_param.empty())
+    {
+        auto start_ts = parseTimestamp(start_param);
+        conditions.push_back(fmt::format("min_time >= {}", start_ts.safeGet<Float64>()));
+    }
+    if (!end_param.empty())
+    {
+        auto end_ts = parseTimestamp(end_param);
+        conditions.push_back(fmt::format("max_time <= {}", end_ts.safeGet<Float64>()));
+    }
+
+    if (!conditions.empty())
+    {
+        /// For __name__ we start fresh with WHERE, for others we already have WHERE
+        if (label_name == "__name__")
+        {
+            sql += " WHERE ";
+            for (size_t i = 0; i < conditions.size(); ++i)
             {
-                conditions.push_back(fmt::format("metric_name = '{}'", match_param));
+                if (i > 0)
+                    sql += " AND ";
+                sql += conditions[i];
             }
         }
-
-        if (!start_param.empty())
+        else
         {
-            auto start_ts = parseTimestamp(start_param);
-            conditions.push_back(fmt::format("min_time >= {}", start_ts.safeGet<Float64>()));
+            for (const auto & cond : conditions)
+                sql += " AND " + cond;
         }
-        if (!end_param.empty())
-        {
-            auto end_ts = parseTimestamp(end_param);
-            conditions.push_back(fmt::format("max_time <= {}", end_ts.safeGet<Float64>()));
-        }
+    }
 
-        if (!conditions.empty())
-        {
-            /// For __name__ we start fresh with WHERE, for others we already have WHERE
-            if (label_name == "__name__")
-            {
-                sql += " WHERE ";
-                for (size_t i = 0; i < conditions.size(); ++i)
-                {
-                    if (i > 0)
-                        sql += " AND ";
-                    sql += conditions[i];
-                }
-            }
-            else
-            {
-                for (const auto & cond : conditions)
-                    sql += " AND " + cond;
-            }
-        }
+    sql += " ORDER BY 1 LIMIT 10000";
 
-        sql += " ORDER BY 1 LIMIT 10000";
-
-        LOG_DEBUG(log, "Label values query SQL: {}", sql);
+    LOG_DEBUG(log, "Label values query SQL: {}", sql);
 
         /// Create a copy of the context for query execution to avoid modifying the original
         auto query_context = Context::createCopy(getContext());
-        query_context->makeQueryContext();
-        query_context->setCurrentQueryId(toString(thread_local_rng()));
+    query_context->makeQueryContext();
+    query_context->setCurrentQueryId(toString(thread_local_rng()));
 
         /// Execute as internal query to prevent assertions in some edge cases
         auto [ast, io] = executeQuery(sql, query_context, QueryFlags{.internal = true}, QueryProcessingStage::Complete);
 
-        PullingPipelineExecutor executor(io.pipeline);
-        Block result_block;
+    PullingPipelineExecutor executor(io.pipeline);
+    Block result_block;
 
-        std::set<String> all_values;
+    std::set<String> all_values;
 
-        while (executor.pull(result_block))
+    while (executor.pull(result_block))
+    {
+        if (result_block.empty() || result_block.rows() == 0)
+            continue;
+
+        const auto & value_column = result_block.getByPosition(0).column;
+        for (size_t row = 0; row < result_block.rows(); ++row)
         {
-            if (result_block.empty() || result_block.rows() == 0)
-                continue;
-
-            const auto & value_column = result_block.getByPosition(0).column;
-            for (size_t row = 0; row < result_block.rows(); ++row)
-            {
-                Field field;
-                value_column->get(row, field);
-                String value;
-                if (field.tryGet<String>(value) && !value.empty())
-                    all_values.insert(value);
-            }
+            Field field;
+            value_column->get(row, field);
+            String value;
+            if (field.tryGet<String>(value) && !value.empty())
+                all_values.insert(value);
         }
+    }
 
-        writeString(R"({"status":"success","data":[)", response);
-        bool first = true;
-        for (const auto & value : all_values)
-        {
-            if (!first)
-                writeString(",", response);
-            first = false;
+    writeString(R"({"status":"success","data":[)", response);
+    bool first = true;
+    for (const auto & value : all_values)
+    {
+        if (!first)
+            writeString(",", response);
+        first = false;
 
-            writeString("\"", response);
-            writeString(value, response);
-            writeString("\"", response);
-        }
-        writeString("]}", response);
+        writeString("\"", response);
+        writeString(value, response);
+        writeString("\"", response);
+    }
+    writeString("]}", response);
     }
     catch (const Exception & e)
     {
