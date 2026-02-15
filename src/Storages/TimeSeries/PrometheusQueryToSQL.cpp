@@ -594,8 +594,8 @@ private:
             case NodeType::UnaryOperator:
                 return buildPieceForUnaryOperator(typeid_cast<const PrometheusQueryTree::UnaryOperator *>(node));
         }
-        
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Prometheus query tree node type {} is not implemented", node_type);
+
+                throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Prometheus query tree node type {} is not implemented", node_type);
     }
 
     /// Builds an empty piece.
@@ -1580,7 +1580,7 @@ private:
         }
         else
         {
-            res.value_column = makeASTFunction(ch_function_name, std::make_shared<ASTIdentifier>(TimeSeriesColumnNames::Value));
+        res.value_column = makeASTFunction(ch_function_name, std::make_shared<ASTIdentifier>(TimeSeriesColumnNames::Value));
         }
         res.value_column->setAlias(TimeSeriesColumnNames::Value);
         res.from_subquery = addSubquery(splitTimeSeriesColumnToTwoNonArrays(std::move(argument)));
@@ -2008,7 +2008,7 @@ private:
                 for (const auto & label : agg_op->labels)
                     labels_array->arguments->children.push_back(std::make_shared<ASTLiteral>(label));
                 labels_array->children.push_back(labels_array->arguments);
-                
+
                 /// Filter tags: arrayFilter(lambda(tuple(tag), arrayExists(lambda(tuple(label), label = tupleElement(tag, 1)), labels_array)), tags_from_group)
                 auto inner_lambda_args = std::make_shared<ASTFunction>();
                 inner_lambda_args->name = "tuple";

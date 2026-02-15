@@ -169,7 +169,7 @@ StorageTimeSeries::StorageTimeSeries(
         // Note: LowCardinality is now supported for external tables (DATA, TAGS, METRICS)
         // The column validators already accept LowCardinality types, so this artificial
         // restriction has been removed.
-        
+
         has_inner_tables |= target.is_inner_table;
     }
 }

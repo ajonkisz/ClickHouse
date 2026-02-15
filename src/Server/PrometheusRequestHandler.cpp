@@ -226,31 +226,31 @@ public:
 #if USE_PROMETHEUS_PROTOBUFS
         try
         {
-            checkHTTPHeader(request, "Content-Type", "application/x-protobuf");
-            checkHTTPHeader(request, "Content-Encoding", "snappy");
+        checkHTTPHeader(request, "Content-Type", "application/x-protobuf");
+        checkHTTPHeader(request, "Content-Encoding", "snappy");
 
 
-            prometheus::WriteRequest write_request;
+        prometheus::WriteRequest write_request;
 
-            {
-                ProtobufZeroCopyInputStreamFromReadBuffer zero_copy_input_stream{
-                    std::make_unique<SnappyReadBuffer>(wrapReadBufferPointer(request.getStream()))};
+        {
+            ProtobufZeroCopyInputStreamFromReadBuffer zero_copy_input_stream{
+                std::make_unique<SnappyReadBuffer>(wrapReadBufferPointer(request.getStream()))};
 
-                if (!write_request.ParsePartialFromZeroCopyStream(&zero_copy_input_stream))
-                    throw Exception(ErrorCodes::BAD_ARGUMENTS, "Cannot parse WriteRequest");
-            }
+            if (!write_request.ParsePartialFromZeroCopyStream(&zero_copy_input_stream))
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Cannot parse WriteRequest");
+        }
 
-            auto table = DatabaseCatalog::instance().getTable(StorageID{config().time_series_table_name}, context);
-            PrometheusRemoteWriteProtocol protocol{table, context};
+        auto table = DatabaseCatalog::instance().getTable(StorageID{config().time_series_table_name}, context);
+        PrometheusRemoteWriteProtocol protocol{table, context};
 
-            if (write_request.timeseries_size())
-                protocol.writeTimeSeries(write_request.timeseries());
+        if (write_request.timeseries_size())
+            protocol.writeTimeSeries(write_request.timeseries());
 
-            if (write_request.metadata_size())
-                protocol.writeMetricsMetadata(write_request.metadata());
+        if (write_request.metadata_size())
+            protocol.writeMetricsMetadata(write_request.metadata());
 
-            response.setStatusAndReason(Poco::Net::HTTPResponse::HTTPStatus::HTTP_NO_CONTENT, Poco::Net::HTTPResponse::HTTP_REASON_NO_CONTENT);
-            response.setChunkedTransferEncoding(false);
+        response.setStatusAndReason(Poco::Net::HTTPResponse::HTTPStatus::HTTP_NO_CONTENT, Poco::Net::HTTPResponse::HTTP_REASON_NO_CONTENT);
+        response.setChunkedTransferEncoding(false);
         }
         catch (const Exception & e)
         {
