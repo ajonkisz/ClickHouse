@@ -1,0 +1,102 @@
+<test>
+    <settings>
+        <enable_alp_codec>1</enable_alp_codec>
+    </settings>
+
+    <!-- Compare complete codec chains, rather than unchained codecs, on
+         series-sorted millisecond timestamps and a mix of metric values.
+         Short series exercise frequent series boundaries; long series expose
+         temporal locality. Regular and jittered intervals avoid favouring one
+         timestamp transform. Neither distribution is a production workload. -->
+    <substitutions>
+        <substitution>
+            <name>timestamp_codec</name>
+            <values>
+                <!-- Equal ZSTD levels separate transform effects from the
+                     general-purpose compression level. The DoubleDelta/T64
+                     chain is a control for chaining two transforms. -->
+                <value>DoubleDelta, ZSTD(1)</value>
+                <value>DoubleDelta, ZSTD(3)</value>
+                <value>Delta, T64, ZSTD(1)</value>
+                <value>Delta, T64, ZSTD(3)</value>
+                <value>DoubleDelta, T64, ZSTD(3)</value>
+            </values>
+        </substitution>
+        <substitution>
+            <name>timestamp_jitter</name>
+            <values>
+                <value>0</value>
+                <value>31</value>
+            </values>
+        </substitution>
+        <substitution>
+            <name>value_codec</name>
+            <values>
+                <value>ZSTD(3)</value>
+                <value>Gorilla, ZSTD(1)</value>
+                <value>Gorilla, ZSTD(3)</value>
+                <value>ALP, ZSTD(3)</value>
+            </values>
+        </substitution>
+        <substitution>
+            <name>samples_per_series</name>
+            <values>
+                <value>32</value>
+                <value>4096</value>
+            </values>
+        </substitution>
+        <substitution>
+            <name>granularity</name>
+            <values>
+                <value>8192</value>
+                <value>32768</value>
+                <value>65536</value>
+            </values>
+        </substitution>
+    </substitutions>
+
+    <create_query>
+        CREATE TABLE `ts_chain_{timestamp_codec}_{value_codec}_{samples_per_series}_{granularity}_{timestamp_jitter}`
+        (
+            id UInt64 CODEC(ZSTD(1)),
+            timestamp DateTime64(3) CODEC({timestamp_codec}),
+            value Float64 CODEC({value_codec})
+        )
+        ENGINE = MergeTree
+        ORDER BY (id, timestamp)
+        SETTINGS index_granularity = {granularity}, auto_statistics_types = ''
+    </create_query>
+
+    <fill_query>
+        INSERT INTO `ts_chain_{timestamp_codec}_{value_codec}_{samples_per_series}_{granularity}_{timestamp_jitter}`
+        SELECT
+            intDiv(number, {samples_per_series}) AS id,
+            fromUnixTimestamp64Milli(1760000000000 + (number % {samples_per_series}) * 15000 + intHash32(number) % greatest({timestamp_jitter}, 1)),
+            multiIf(
+                id % 3 = 0, toFloat64(number % {samples_per_series}),
+                id % 3 = 1, 42.0,
+                round(0.5 + sin((number % {samples_per_series}) / 100.0), 3))
+        FROM numbers(262144)
+        SETTINGS max_threads = 1
+    </fill_query>
+
+    <!-- Force both columns to be decoded; count() or max(timestamp) alone
+         could use metadata instead of exercising the decompressor. -->
+    <query>
+        SELECT sum(toUnixTimestamp64Milli(timestamp)), groupBitXor(reinterpretAsUInt64(value))
+        FROM `ts_chain_{timestamp_codec}_{value_codec}_{samples_per_series}_{granularity}_{timestamp_jitter}`
+        SETTINGS max_threads = 1
+    </query>
+
+    <!-- This measures decoding plus recompression, not isolated encoder
+         throughput. The returned ratios also permit a size comparison. -->
+    <query>
+        SELECT
+            estimateCompressionRatio('{timestamp_codec}')(timestamp),
+            estimateCompressionRatio('{value_codec}')(value)
+        FROM `ts_chain_{timestamp_codec}_{value_codec}_{samples_per_series}_{granularity}_{timestamp_jitter}`
+        SETTINGS max_threads = 1
+    </query>
+
+    <drop_query>DROP TABLE `ts_chain_{timestamp_codec}_{value_codec}_{samples_per_series}_{granularity}_{timestamp_jitter}`</drop_query>
+</test>
