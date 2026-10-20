@@ -12,10 +12,37 @@ The checks below ran on isolated stock head 26.11.1.290, commit `607e4c1e3f6d8a0
 | Custom timestamp control | 40 fully framed timestamp-chain cases at equal ZSTD levels 1/3; original VarInt core and all T64 outputs roundtripped. This is a standalone size experiment, not a native custom-codec integration or CPU benchmark. |
 | Native Prometheus HTTP API | 12/12 checks: Snappy/protobuf remote write, instant GET, aggregation POST, rate, range query, series/label discovery, exact-batch replay, out-of-order samples, dotted metric names and malformed-query errors. |
 | OTel bridge | 9/9 checks through an actual stock Collector: OTLP JSON -> Prometheus remote write -> stock ClickHouse. Cumulative counter, gauge, classic histogram, rate/quantile, normalized labels and timestamps passed. No Kafka was involved. |
+| OTel inputs needing conversion | In the plain bridge, OTLP requests containing a delta monotonic sum or cumulative exponential histogram returned HTTP 200, but neither produced a backend series; a cumulative-counter control did. An accepted OTLP request is not proof that every metric was exported. |
+| Opt-in stock OTel conversions | 9/9 additional checks passed with `deltatocumulative` and explicit-histogram conversion: deltas 5/7/11 became cumulative 5/12/23; the positive aligned histogram fixture retained count 18, sum 36 and expected buckets/quantiles. No native exponential-histogram preservation or recovery behavior was established. |
 
 The cached Collector image was tagged `0.146.0` but self-reported `0.145.0`; its digest and the discrepancy were recorded. Choose and verify the intended Collector build before production qualification.
 
+The [tested exporter version's documentation](https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/v0.146.0/exporter/prometheusremotewriteexporter/README.md) documents dropping noncumulative monotonic inputs and incomplete remote-write-v2/native-histogram support. The observed omissions establish a coverage gap in this plain bridge, not a demonstrated ClickHouse bug. Delta accumulation and histogram conversion require explicit policy and validation; preserving native exponential histograms is a separate requirement.
+
 The codec tests show no universal winner. Delta/T64 won jittered timestamps; DoubleDelta won perfectly regular intervals. ZSTD(3) did not consistently beat ZSTD(1). T64 after the packed VarInt stream did not improve the tested cases. These are synthetic results, not GR capacity estimates.
+
+## Optional Collector conversions
+
+The following processor fragment was exercised with the test Collector. Add it to an existing metrics pipeline before `batch` and the remote-write exporter only if these conversions meet the workload's requirements:
+
+```yaml
+processors:
+  deltatocumulative:
+    max_stale: 5m
+    max_streams: 100 # Smoke limit only; excess streams are dropped.
+  transform/explicit_histogram:
+    error_mode: propagate
+    metric_statements:
+      - context: metric
+        statements:
+          - 'convert_exponential_histogram_to_histogram("upper", [0.0, 1.0, 2.0, 4.0, 8.0])'
+```
+
+The tested processor order was `[deltatocumulative, transform/explicit_histogram, batch]`. This is a configuration fragment, not a complete Collector deployment.
+
+The [delta processor](https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/v0.146.0/processor/deltatocumulativeprocessor/README.md) is alpha and accumulates in memory. Size its stream limit, route each series consistently, and test ordering, stale expiry, restarts, rebalances and replay. The smoke does not establish persistent totals across failures.
+
+The [histogram transform](https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/v0.146.0/processor/transformprocessor/README.md#convert_exponential_histogram_to_histogram) is a lossy conversion with explicit target boundaries. The above boundaries suit only the small positive fixture; they are not a GR bucket policy. Test negative values, zeros, misaligned buckets and the resulting quantile error. If preserving native exponential histograms is required, this workaround does not satisfy that requirement.
 
 ## Re-run the native API smoke
 
@@ -30,7 +57,7 @@ python3 run/gr/smoke_ingestion.py \
   --output /tmp/gr-ingestion-smoke.json
 ```
 
-The script creates the fixture if absent and writes small synthetic metric series with a unique `run` label. It deletes nothing. `IF NOT EXISTS` does not upgrade an existing schema. Its replay assertion establishes observed query-result deduplication, not physical exactly-once storage or durability through a crash.
+The script creates the fixture if absent and writes small synthetic metric series with a unique `run` label. Schema statements share a unique HTTP session, and evidence checks the selected default engine and every generated target's engine family. It deletes nothing. `IF NOT EXISTS` does not upgrade an existing schema. Its replay assertion establishes observed query-result deduplication, not physical exactly-once storage or durability through a crash.
 
 ## Concrete next tests
 
