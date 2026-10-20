@@ -1,0 +1,13 @@
+<clickhouse>
+    <http_handlers>
+        <defaults/>
+        <rule>
+            <url_prefix>/prometheus/api/v1</url_prefix>
+            <handler>
+                <type>prometheus_api_v1</type>
+                <database>gr_metrics</database>
+                <table>metrics</table>
+            </handler>
+        </rule>
+    </http_handlers>
+</clickhouse>
