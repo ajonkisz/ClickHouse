@@ -2,6 +2,8 @@
 
 These profiles start a new metrics qualification against current upstream master. They do not claim to be optimal for GR data. The comparison point is AJ's [original 2025 TimeSeries schema](https://github.com/ajonkisz/ClickHouse/blob/promql/run/config/create_ts_inner_tables_config_final.sql), which remains preserved on `promql`.
 
+See [the concrete test plan and completed smoke checks](TEST_PLAN.md) before selecting codecs or replaying Kafka data.
+
 Use `metrics_mergetree.sql` locally and `metrics_sharedmergetree.sql` on the on-prem build that supplies SharedMergeTree. Both create `gr_metrics.metrics`; use separate services/databases when comparing them. `IF NOT EXISTS` does not update an older schema. Inspect `SHOW CREATE TABLE gr_metrics.metrics` before testing an existing deployment.
 
 ```sh
