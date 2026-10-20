@@ -391,7 +391,8 @@ def test_index_granularity():
 
 # Checks that a TimeSeries table can be used to access pre-existing external tables
 # instead of its own inner tables.
-def test_external_tables():
+@pytest.mark.parametrize("metric_family_type", ["String", "LowCardinality(String)"])
+def test_external_tables(metric_family_type):
     node.query(
         "CREATE TABLE mysamples (id UUID, timestamp DateTime64(3), value Float64) "
         "ENGINE=MergeTree ORDER BY (id, timestamp)"
@@ -409,7 +410,8 @@ def test_external_tables():
     )
 
     node.query(
-        "CREATE TABLE mymetrics (metric_family String, type LowCardinality(String), unit LowCardinality(String), help String) "
+        f"CREATE TABLE mymetrics (metric_family {metric_family_type}, "
+        "type LowCardinality(String), unit LowCardinality(String), help String) "
         "ENGINE=ReplacingMergeTree ORDER BY metric_family"
     )
     node.query(
@@ -417,6 +419,17 @@ def test_external_tables():
         "SAMPLES mysamples TAGS mytags METRICS mymetrics"
     )
     check()
+
+    # Metadata must reach the specified external table, including when its
+    # metric-family column is dictionary-encoded (the regression from #97034).
+    node.query(
+        "INSERT INTO prometheus (metric_family, type, unit, help) "
+        "VALUES ('external_metadata_test', 'counter', 'requests', 'External metadata')"
+    )
+    assert node.query(
+        "SELECT metric_family, type, unit, help FROM mymetrics "
+        "WHERE metric_family = 'external_metadata_test'"
+    ) == "external_metadata_test\tcounter\trequests\tExternal metadata\n"
 
 
 # Checks that the `DATA` keyword works as an alias for `SAMPLES`
