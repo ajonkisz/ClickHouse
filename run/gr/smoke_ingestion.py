@@ -4,6 +4,7 @@ import base64
 import json
 import os
 from pathlib import Path
+import re
 import struct
 import time
 import urllib.error
@@ -56,6 +57,7 @@ def main():
     auth = "Basic " + base64.b64encode(
         (args.username + ":" + os.environ[args.password_env]).encode()
     ).decode()
+    schema_session = "gr-smoke-schema-" + str(time.time_ns())
 
     def request(path, params=None, data=None, headers=None):
         if params:
@@ -64,7 +66,14 @@ def main():
         try:
             with urllib.request.urlopen(req, timeout=30) as response:
                 raw = response.read()
-                return response.status, json.loads(raw) if raw else None
+                if not raw:
+                    result = None
+                else:
+                    try:
+                        result = json.loads(raw)
+                    except json.JSONDecodeError:
+                        result = [json.loads(line) for line in raw.splitlines() if line]
+                return response.status, result
         except urllib.error.HTTPError as error:
             raw = error.read().decode()
             try:
@@ -74,17 +83,35 @@ def main():
             return error.code, raw
 
     def sql(query):
-        status, result = request("/", data=(query + " FORMAT JSONEachRow").encode())
+        status, result = request("/", {"session_id": schema_session}, data=(query + " FORMAT JSONEachRow").encode())
         assert status == 200, (status, result)
         return result
 
-    # Each schema statement is one request. The API user's profile enables
-    # TimeSeries; the file's SET statements are not relied on across requests.
-    for statement in args.schema.read_text().split(";"):
+    # A session preserves SET values across the separate schema requests.
+    schema = args.schema.read_text()
+    engine_match = re.search(r"SET\s+default_table_engine\s*=\s*'([A-Za-z]+)'", schema)
+    assert engine_match, "The schema must set its intended default_table_engine"
+    expected_engine = engine_match.group(1)
+    assert expected_engine in {"MergeTree", "SharedMergeTree"}, expected_engine
+    for statement in schema.split(";"):
         statement = statement.strip()
         if statement:
-            status, result = request("/", data=statement.encode())
+            status, result = request("/", {"session_id": schema_session}, data=statement.encode())
             assert status == 200, (status, result)
+
+    settings = sql("SELECT getSetting('default_table_engine') AS default_table_engine")
+    assert settings["default_table_engine"] == expected_engine, settings
+    targets = sql(
+        "SELECT name, engine FROM system.tables WHERE database = 'gr_metrics' "
+        "AND startsWith(name, '.inner_id.') AND endsWith(name, "
+        "(SELECT toString(uuid) FROM system.tables WHERE database = 'gr_metrics' AND name = 'metrics')) "
+        "ORDER BY name"
+    )
+    if isinstance(targets, dict):
+        targets = [targets]
+    prefix = "Shared" if expected_engine == "SharedMergeTree" else ""
+    allowed_engines = {prefix + name for name in ("MergeTree", "ReplacingMergeTree", "AggregatingMergeTree")}
+    assert targets and all(target["engine"] in allowed_engines for target in targets), targets
 
     run = str(time.time_ns())
     t0 = (int(time.time()) - 60) * 1000
@@ -92,7 +119,7 @@ def main():
     labels = {"__name__": "gr_smoke_counter_total", "job": "gr", "host": "h1", "run": run}
     selector = 'gr_smoke_counter_total{run="' + run + '"}'
     payload = write_request(labels, [(t0, 100), (t0 + 15000, 115), (t0 + 30000, 130)])
-    evidence = {"scope": "Isolated stock-head HTTP remote-write/query smoke; no Kafka, Collector, SharedMergeTree or load qualification", "checks": [], "observations": {}}
+    evidence = {"scope": "Isolated HTTP remote-write/query smoke; does not exercise Kafka, Collector, failover or load", "checks": [], "observations": {"schema_settings": settings, "target_engines": targets}}
 
     def check(name, fn):
         try:
